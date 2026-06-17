@@ -24,6 +24,8 @@ val empty : unit -> 'a t
 val empty_by : ?settings:settings -> 'a comparator -> 'a t
 val of_list : 'a list -> 'a t
 val of_list_by : ?settings:settings -> 'a comparator -> 'a list -> 'a t
+val of_sorted_array : 'a array -> 'a t
+val of_sorted_array_by : ?settings:settings -> 'a comparator -> 'a array -> 'a t
 val add : ?cmp:'a comparator -> 'a -> 'a t -> 'a t
 val remove : ?cmp:'a comparator -> 'a -> 'a t -> 'a t
 val mem : ?cmp:'a comparator -> 'a -> 'a t -> bool

@@ -157,6 +157,59 @@ let test_settings_validate_branching_factor () =
     "restore rejects invalid branching factors"
     (fun () -> ignore (restore ~cmp:compare ~settings:{ branching_factor = 1 } storage "root"))
 
+let test_of_sorted_array_uses_sorted_input_and_settings () =
+  let memory = Hashtbl.create 16 in
+  let writes = ref 0 in
+  let storage =
+    { store_node =
+        (fun node ->
+          incr writes;
+          let address = "node-" ^ string_of_int !writes in
+          Hashtbl.replace memory address node;
+          address)
+    ; restore_node = (fun address -> Hashtbl.find_opt memory address)
+    ; accessed = (fun _ -> ())
+    }
+  in
+  let custom_settings = { branching_factor = 3 } in
+  let set =
+    of_sorted_array_by
+      ~settings:custom_settings
+      compare
+      [| 0; 1; 1; 2; 3; 3; 4; 5; 6 |]
+  in
+  assert_equal_list
+    "of_sorted_array_by drops adjacent comparator-equal values"
+    (irange 0 6)
+    (to_list set);
+  if settings set <> custom_settings then failwith "of_sorted_array_by should preserve settings";
+  let root, stored = store storage set in
+  assert_equal_int "of_sorted_array_by settings control stored leaf count" 4 !writes;
+  assert_equal_string_list
+    "of_sorted_array_by stores with custom-sized leaves"
+    [ root; "node-1"; "node-2"; "node-3" ]
+    (walk_addresses stored);
+  (match Hashtbl.find_opt memory root with
+   | Some (Branch (keys, child_addresses)) ->
+     assert_equal_list "of_sorted_array_by branch keys follow custom chunks" [ 2; 5; 6 ] keys;
+     assert_equal_list
+       "of_sorted_array_by branch addresses follow custom chunks"
+       [ "node-1"; "node-2"; "node-3" ]
+       child_addresses
+   | Some _ -> failwith "of_sorted_array_by custom settings should create a branch root"
+   | None -> failwith "of_sorted_array_by root should be stored");
+  let descending =
+    of_sorted_array_by (fun left right -> compare right left) [| 9; 7; 7; 5 |]
+  in
+  assert_equal_list
+    "of_sorted_array_by respects custom comparator order"
+    [ 9; 7; 5 ]
+    (to_list descending);
+  assert_equal_list
+    "of_sorted_array uses default comparator"
+    [ 1; 2; 3 ]
+    (to_list (of_sorted_array [| 1; 2; 2; 3 |]))
+
 let test_sorted_order_and_uniqueness () =
   let set = of_list (List.rev (irange 10 20)) in
   assert_equal_list "set iterates in sorted order" (irange 10 20) (to_list set);
@@ -1140,6 +1193,7 @@ let () =
   test_settings_control_storage_branching_factor ();
   test_restore_preserves_settings_for_later_edits ();
   test_settings_validate_branching_factor ();
+  test_of_sorted_array_uses_sorted_input_and_settings ();
   test_sorted_order_and_uniqueness ();
   test_custom_comparator_and_override_compare ();
   test_equal_comparator_slice_ranges ();

@@ -298,6 +298,22 @@ let of_list_by ?settings cmp values =
 
 let of_list values = of_list_by default_cmp values
 
+let distinct_sorted_values cmp values =
+  let rec loop acc = function
+    | [] -> List.rev acc
+    | value :: rest ->
+      (match acc with
+       | previous :: _ when cmp previous value = 0 -> loop acc rest
+       | _ -> loop (value :: acc) rest)
+  in
+  loop [] values
+
+let of_sorted_array_by ?settings cmp values =
+  let set = empty_by ?settings cmp in
+  { set with data = Loaded (values |> Array.to_list |> distinct_sorted_values set.cmp) }
+
+let of_sorted_array values = of_sorted_array_by default_cmp values
+
 let remove_from_stored_chunks order_cmp equality_cmp value stored_chunks =
   let rec loop acc = function
     | [] -> List.rev acc
