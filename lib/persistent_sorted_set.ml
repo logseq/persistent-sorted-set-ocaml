@@ -734,8 +734,41 @@ let restore ~cmp ?(settings = default_settings) storage address =
     ; stored_branch_chunks = []
     }
 
+let rec walk_storage_addresses storage address =
+  storage.accessed address;
+  match storage.restore_node address with
+  | Some (Branch (_, child_addresses)) ->
+    address :: List.concat_map (walk_storage_addresses storage) child_addresses
+  | Some (Values _)
+  | Some (Leaf _) ->
+    [ address ]
+  | None -> invalid_arg ("stored node not found: " ^ address)
+
+let rec walk_branch_chunk_addresses branch_chunks address =
+  let child_refs =
+    branch_chunks
+    |> List.find_map (fun (child_refs, stored_address) ->
+      match stored_address with
+      | Some stored_address when stored_address = address -> Some child_refs
+      | Some _ | None -> None)
+  in
+  match child_refs with
+  | None -> [ address ]
+  | Some child_refs ->
+    address
+    :: (child_refs
+        |> List.concat_map (fun (_, child_address) -> walk_branch_chunk_addresses branch_chunks child_address))
+
 let walk_addresses set =
-  match set.stored_addresses, set.root_address with
-  | Some addresses, _ -> addresses
-  | None, Some address -> [ address ]
-  | None, None -> []
+  match set.root_address with
+  | None -> []
+  | Some address ->
+    (match set.data with
+     | Deferred { storage; address } -> walk_storage_addresses storage address
+     | Loaded _ | Edited _ ->
+       if set.stored_branch_chunks <> [] then
+         walk_branch_chunk_addresses set.stored_branch_chunks address
+       else
+         match set.stored_addresses with
+         | Some addresses -> addresses
+         | None -> [ address ])

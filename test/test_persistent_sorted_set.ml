@@ -1059,6 +1059,56 @@ let test_storage_uses_nested_branch_nodes_for_very_large_sets () =
    | None -> failwith "very large restore should find the stored root");
   assert_equal_int "very large restored access reads every branch and leaf" 36 !reads
 
+let test_restored_walk_addresses_visits_stored_descendants () =
+  let make_storage () =
+    let memory = Hashtbl.create 128 in
+    let writes = ref 0 in
+    let reads = ref 0 in
+    let storage =
+      { store_node =
+          (fun node ->
+            incr writes;
+            let address = "node-" ^ string_of_int !writes in
+            Hashtbl.replace memory address node;
+            address)
+      ; restore_node =
+          (fun address ->
+            incr reads;
+            Hashtbl.find_opt memory address)
+      ; accessed = (fun _ -> ())
+      }
+    in
+    storage
+  in
+  let storage = make_storage () in
+  let shallow_original = of_list (irange 0 100) in
+  let shallow_root, _ = store storage shallow_original in
+  let shallow_restored =
+    match restore ~cmp:compare storage shallow_root with
+    | Some restored -> restored
+    | None -> failwith "restore should return shallow stored set"
+  in
+  assert_equal_string_list
+    "restored shallow walk_addresses should include root and leaf addresses"
+    [ shallow_root; "node-1"; "node-2"; "node-3"; "node-4" ]
+    (walk_addresses shallow_restored);
+  let storage = make_storage () in
+  let nested_original = of_list (irange 0 1055) in
+  let nested_root, nested_stored = store storage nested_original in
+  if List.length (walk_addresses nested_stored) <> 36 then
+    failwith "stored nested walk_addresses should include every stored descendant";
+  let nested_restored =
+    match restore ~cmp:compare storage nested_root with
+    | Some restored -> restored
+    | None -> failwith "restore should return nested stored set"
+  in
+  assert_equal_string_list
+    "restored nested walk_addresses should include root, branch, and leaf addresses"
+    ([ "node-36"; "node-34" ]
+     @ List.init 32 (fun index -> "node-" ^ string_of_int (index + 1))
+     @ [ "node-35"; "node-33" ])
+    (walk_addresses nested_restored)
+
 let test_nested_storage_remove_reuses_unchanged_branch_addresses () =
   let memory = Hashtbl.create 64 in
   let writes = ref 0 in
@@ -1219,6 +1269,7 @@ let () =
   test_restored_slice_seq_construction_is_lazy ();
   test_restored_rslice_seq_construction_is_lazy ();
   test_storage_uses_nested_branch_nodes_for_very_large_sets ();
+  test_restored_walk_addresses_visits_stored_descendants ();
   test_nested_storage_remove_reuses_unchanged_branch_addresses ();
   test_restored_nested_remove_reuses_unchanged_branch_addresses_lazily ();
   test_restored_nested_add_reuses_unchanged_branch_addresses_lazily ()
