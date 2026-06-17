@@ -1,0 +1,19 @@
+(executable
+ (name test_persistent_sorted_set)
+ (libraries persistent_sorted_set))
+
+(rule
+ (alias runtest)
+ (action
+  (run ./test_persistent_sorted_set.exe)))
+
+(executable
+ (name js_smoke)
+ (modes js)
+ (libraries persistent_sorted_set))
+
+(rule
+ (alias runtest)
+ (deps js_smoke.bc.js)
+ (action
+  (run node %{dep:js_smoke.bc.js})))

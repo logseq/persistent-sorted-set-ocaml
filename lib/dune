@@ -1,0 +1,4 @@
+(library
+ (name persistent_sorted_set)
+ (public_name persistent_sorted_set_ocaml)
+ (modules persistent_sorted_set))

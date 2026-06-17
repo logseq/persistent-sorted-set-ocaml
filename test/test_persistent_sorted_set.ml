@@ -1,0 +1,960 @@
+open Persistent_sorted_set
+
+let failf fmt = Printf.ksprintf failwith fmt
+
+let assert_equal_list label expected actual =
+  if expected <> actual then failf "%s: unexpected list" label
+
+let assert_equal_int label expected actual =
+  if expected <> actual then failf "%s: expected %d, got %d" label expected actual
+
+let irange from_ to_ =
+  let rec loop acc current =
+    if from_ <= to_ then
+      if current < from_ then acc else loop (current :: acc) (current - 1)
+    else if current > from_ then acc
+    else loop (current :: acc) (current + 1)
+  in
+  loop [] to_
+
+let shuffled values =
+  values
+  |> List.mapi (fun index value -> ((index * 37) mod 97, value))
+  |> List.sort compare
+  |> List.map snd
+
+let compare_pair_with_nil_wildcard (x0, x1) (y0, y1) =
+  let compare_part left right =
+    match left, right with
+    | Some left, Some right -> compare left right
+    | _ -> 0
+  in
+  match compare_part x0 y0 with
+  | 0 -> compare_part x1 y1
+  | n when n < 0 -> -1
+  | _ -> 1
+
+let quotient_compare divisor left right = compare (left / divisor) (right / divisor)
+
+let test_sorted_order_and_uniqueness () =
+  let set = of_list (List.rev (irange 10 20)) in
+  assert_equal_list "set iterates in sorted order" (irange 10 20) (to_list set);
+  let with_duplicates = of_list [ 3; 2; 1; 2; 3; 4 ] in
+  assert_equal_list "set removes duplicate comparator-equal values" [ 1; 2; 3; 4 ] (to_list with_duplicates);
+  assert_equal_int "count reports unique values" 4 (count with_duplicates);
+  if not (mem 3 with_duplicates) then failwith "mem should find present values";
+  if mem 5 with_duplicates then failwith "mem should reject absent values";
+  assert_equal_list "remove deletes present values" [ 1; 2; 4 ] (to_list (remove 3 with_duplicates))
+
+let test_custom_comparator_and_override_compare () =
+  let descending = of_list_by (fun left right -> compare right left) [ 1; 2; 3 ] in
+  assert_equal_list "custom comparator controls order" [ 3; 2; 1 ] (to_list descending);
+  let values = shuffled (irange 0 120) in
+  let grouped = List.fold_left (fun set value -> add ~cmp:compare value set) (empty_by (quotient_compare 10)) values in
+  assert_equal_list
+    "override compare lets comparator-equal values coexist"
+    (irange 30 39)
+    (slice ~from_:30 ~to_:30 grouped)
+
+let test_equal_comparator_slice_ranges () =
+  let set10 =
+    List.fold_left
+      (fun set value -> add ~cmp:compare value set)
+      (empty_by (quotient_compare 10))
+      (shuffled (irange 0 5000))
+  in
+  assert_equal_list "slice returns all members comparator-equal to a single bound" (irange 30 39) (slice ~from_:30 ~to_:30 set10);
+  assert_equal_list
+    "slice returns all comparator-equal members across a grouped range"
+    (irange 130 4979)
+    (slice ~from_:130 ~to_:4970 set10);
+  assert_equal_list
+    "reverse slice returns all members comparator-equal to a single bound"
+    (irange 39 30)
+    (rslice ~from_:30 ~to_:30 set10);
+  assert_equal_list
+    "reverse slice returns all comparator-equal members across a grouped range"
+    (irange 4979 130)
+    (rslice ~from_:4970 ~to_:130 set10);
+  let set100 =
+    List.fold_left
+      (fun set value -> add ~cmp:compare value set)
+      (empty_by (quotient_compare 100))
+      (shuffled (irange 0 5000))
+  in
+  assert_equal_list "coarse slice includes the full lower comparator bucket" (irange 0 99) (slice ~from_:30 ~to_:30 set100);
+  assert_equal_list
+    "coarse slice includes full comparator buckets across a grouped range"
+    (irange 100 4899)
+    (slice ~from_:130 ~to_:4850 set100);
+  assert_equal_list
+    "coarse reverse slice includes the full lower comparator bucket"
+    (irange 99 0)
+    (rslice ~from_:30 ~to_:30 set100);
+  assert_equal_list
+    "coarse reverse slice includes full comparator buckets across a grouped range"
+    (irange 4899 100)
+    (rslice ~from_:4850 ~to_:130 set100)
+
+let test_restored_equal_comparator_slice_ranges () =
+  let memory = Hashtbl.create 256 in
+  let writes = ref 0 in
+  let storage =
+    { store_node =
+        (fun node ->
+          incr writes;
+          let address = "node-" ^ string_of_int !writes in
+          Hashtbl.replace memory address node;
+          address)
+    ; restore_node = (fun address -> Hashtbl.find_opt memory address)
+    ; accessed = (fun _ -> ())
+    }
+  in
+  let original =
+    List.fold_left
+      (fun set value -> add ~cmp:compare value set)
+      (empty_by (quotient_compare 10))
+      (shuffled (irange 0 5000))
+  in
+  let root, _ = store storage original in
+  let restored =
+    match restore ~cmp:(quotient_compare 10) storage root with
+    | Some restored -> restored
+    | None -> failwith "restore should find the stored grouped set"
+  in
+  assert_equal_list
+    "restored slice returns all comparator-equal members across a grouped range"
+    (irange 130 4979)
+    (slice ~from_:130 ~to_:4970 restored);
+  assert_equal_list
+    "restored reverse slice returns all comparator-equal members across a grouped range"
+    (irange 4979 130)
+    (rslice ~from_:4970 ~to_:130 restored)
+
+let test_pair_comparator_nil_wildcard_slices () =
+  let set =
+    empty_by compare_pair_with_nil_wildcard
+    |> add (Some "a", Some "b")
+    |> add (Some "b", Some "x")
+    |> add (Some "b", Some "q")
+    |> add (Some "a", Some "d")
+  in
+  assert_equal_list
+    "wildcard slice matches all values"
+    [ Some "a", Some "b"; Some "a", Some "d"; Some "b", Some "q"; Some "b", Some "x" ]
+    (slice ~from_:(None, None) ~to_:(None, None) set);
+  assert_equal_list
+    "wildcard slice matches first component"
+    [ Some "a", Some "b"; Some "a", Some "d" ]
+    (slice ~from_:(Some "a", None) ~to_:(Some "a", None) set);
+  assert_equal_list
+    "wildcard slice matches exact tuple"
+    [ Some "b", Some "q" ]
+    (slice ~from_:(Some "b", Some "q") ~to_:(Some "b", Some "q") set);
+  assert_equal_list
+    "wildcard slice handles non-matching subrange"
+    [ Some "a", Some "d"; Some "b", Some "q" ]
+    (slice ~from_:(Some "a", Some "c") ~to_:(Some "b", Some "r") set)
+
+let test_slice_boundaries () =
+  let set = of_list (shuffled (irange 0 5000)) in
+  let expect label from_ to_ values = assert_equal_list label values (slice ?from_ ?to_ set) in
+  expect "slice all" None None (irange 0 5000);
+  expect "slice lower outside" (Some (-1)) None (irange 0 5000);
+  expect "slice lower exact" (Some 1) None (irange 1 5000);
+  expect "slice upper exact" None (Some 1) [ 0; 1 ];
+  expect "slice inclusive middle" (Some 2499) (Some 2501) [ 2499; 2500; 2501 ];
+  expect "slice single exact" (Some 2500) (Some 2500) [ 2500 ];
+  expect "slice empty above" (Some 5001) (Some 5002) []
+
+let test_reverse_slice_boundaries () =
+  let set = of_list (shuffled (irange 0 5000)) in
+  let expect label from_ to_ values = assert_equal_list label values (rslice ?from_ ?to_ set) in
+  expect "rslice all" None None (irange 5000 0);
+  expect "rslice upper outside" (Some 5001) None (irange 5000 0);
+  expect "rslice lower exact" (Some 1) None [ 1; 0 ];
+  expect "rslice to exact" None (Some 4999) [ 5000; 4999 ];
+  expect "rslice inclusive middle" (Some 2501) (Some 2499) [ 2501; 2500; 2499 ];
+  expect "rslice single exact" (Some 2500) (Some 2500) [ 2500 ];
+  expect "rslice empty below" (Some (-1)) (Some (-2)) []
+
+let test_seek () =
+  let set = of_list (irange 0 1000) in
+  let seq = seq set in
+  let rseq = rseq set in
+  assert_equal_list "seek on ascending sequence" (irange 500 1000) (seq_to_list (seek 500 seq));
+  assert_equal_list "seek on descending sequence" (irange 500 0) (seq_to_list (seek 500 rseq));
+  assert_equal_list
+    "seek can be chained on ascending sequence"
+    (irange 750 1000)
+    (seq |> seek 250 |> seek 750 |> seq_to_list);
+  assert_equal_list
+    "ascending seek results can be reversed"
+    (irange 1000 750)
+    (seq |> seek 250 |> seek 750 |> seq_reverse |> seq_to_list);
+  assert_equal_list
+    "seek can be chained on descending sequence"
+    (irange 250 0)
+    (rseq |> seek 750 |> seek 250 |> seq_to_list);
+  assert_equal_list
+    "descending seek results can be reversed"
+    (irange 0 250)
+    (rseq |> seek 750 |> seek 250 |> seq_reverse |> seq_to_list)
+
+let test_slice_sequences_are_seekable_and_reversible () =
+  let set = of_list (irange 0 10000) in
+  assert_equal_list
+    "seek works on ascending slice sequences"
+    (irange 5000 7500)
+    (slice_seq ~from_:2500 ~to_:7500 set |> seek 5000 |> seq_to_list);
+  assert_equal_list
+    "seek can be chained on ascending slice sequences"
+    [ 7500 ]
+    (slice_seq ~from_:2500 ~to_:7500 set |> seek 5000 |> seek 7500 |> seq_to_list);
+  assert_equal_list
+    "ascending slice sequences can be reversed"
+    (irange 7500 5000)
+    (slice_seq ~from_:2500 ~to_:7500 set |> seek 5000 |> seq_reverse |> seq_to_list);
+  assert_equal_list
+    "seek works on reverse slice sequences"
+    (irange 5000 2500)
+    (rslice_seq ~from_:7500 ~to_:2500 set |> seek 5000 |> seq_to_list);
+  assert_equal_list
+    "seek can be chained on reverse slice sequences"
+    [ 2500 ]
+    (rslice_seq ~from_:7500 ~to_:2500 set |> seek 5000 |> seek 2500 |> seq_to_list);
+  assert_equal_list
+    "reverse slice sequences can be reversed"
+    (irange 2500 5000)
+    (rslice_seq ~from_:7500 ~to_:2500 set |> seek 5000 |> seq_reverse |> seq_to_list)
+
+let test_fold_reduces_sets_and_sequences () =
+  let sum acc value = acc + value in
+  let set = of_list (irange 0 5000) in
+  assert_equal_int "fold empty set returns init" 0 (fold sum 0 (empty ()));
+  assert_equal_int "fold sums full set" 12_502_500 (fold sum 0 set);
+  assert_equal_int "fold_seq sums ascending sequence" 12_502_500 (fold_seq sum 0 (seq set));
+  assert_equal_int "fold_seq sums descending sequence" 12_502_500 (fold_seq sum 0 (rseq set));
+  assert_equal_int "fold_list sums slice" 7_502_500 (fold_list sum 0 (slice ~from_:1000 ~to_:4000 set));
+  assert_equal_int "fold_list sums reverse slice" 7_502_500 (fold_list sum 0 (rslice ~from_:4000 ~to_:1000 set));
+  assert_equal_int "fold_seq sums seek result" 12_471_375 (fold_seq sum 0 (seq set |> seek 250));
+  assert_equal_int "fold_seq sums reversed seek result" 12_471_375 (fold_seq sum 0 (seq set |> seek 250 |> seq_reverse))
+
+let test_storage_round_trip_and_stable_addresses () =
+  let memory = Hashtbl.create 8 in
+  let writes = ref 0 in
+  let reads = ref 0 in
+  let accessed = ref [] in
+  let storage =
+    { store_node =
+        (fun node ->
+          incr writes;
+          let address = "node-" ^ string_of_int !writes in
+          Hashtbl.replace memory address node;
+          address)
+    ; restore_node =
+        (fun address ->
+          incr reads;
+          Hashtbl.find_opt memory address)
+    ; accessed = (fun address -> accessed := address :: !accessed)
+    }
+  in
+  let original = of_list (irange 0 10) in
+  let root, stored = store storage original in
+  assert_equal_int "store writes the root once" 1 !writes;
+  assert_equal_list "walk_addresses reports stored root" [ root ] (walk_addresses stored);
+  let same_root, stored_again = store storage stored in
+  if same_root <> root then failwith "store should return the stable root address";
+  assert_equal_int "storing an already stored set does not write again" 1 !writes;
+  (match restore ~cmp:compare storage root with
+   | Some restored ->
+     assert_equal_int "restore should not read before access" 0 !reads;
+     assert_equal_list "restore should not mark addresses accessed before access" [] !accessed;
+     assert_equal_list "restore round-trips stored values" (to_list original) (to_list restored)
+   | None -> failwith "restore should find the stored root");
+  assert_equal_int "accessing restored values reads the root once" 1 !reads;
+  assert_equal_list "accessing restored values marks the root as accessed" [ root ] !accessed;
+  let changed = add 101 stored_again in
+  let changed_root, changed_stored = store storage changed in
+  if changed_root = root then failwith "modified stored set should get a new root address";
+  assert_equal_int "modified set writes a new root" 2 !writes;
+  assert_equal_list "walk_addresses reports the new root" [ changed_root ] (walk_addresses changed_stored);
+  let duplicate = add 101 changed_stored in
+  let duplicate_root, _ = store storage duplicate in
+  if duplicate_root <> changed_root then failwith "adding an existing value should keep the stored root";
+  assert_equal_int "unchanged duplicate add does not write again" 2 !writes
+
+let test_storage_uses_leaf_and_branch_nodes_for_large_sets () =
+  let memory = Hashtbl.create 16 in
+  let writes = ref 0 in
+  let reads = ref 0 in
+  let accessed = ref [] in
+  let storage =
+    { store_node =
+        (fun node ->
+          incr writes;
+          let address = "node-" ^ string_of_int !writes in
+          Hashtbl.replace memory address node;
+          address)
+    ; restore_node =
+        (fun address ->
+          incr reads;
+          Hashtbl.find_opt memory address)
+    ; accessed = (fun address -> accessed := address :: !accessed)
+    }
+  in
+  let original = of_list (irange 0 100) in
+  let root, stored = store storage original in
+  let stored_addresses = walk_addresses stored in
+  assert_equal_int "large store writes leaf nodes plus a root branch" 5 !writes;
+  assert_equal_list "walk_addresses returns the root followed by leaves" [ root; "node-1"; "node-2"; "node-3"; "node-4" ] stored_addresses;
+  (match Hashtbl.find_opt memory root with
+   | Some (Branch (keys, child_addresses)) ->
+     assert_equal_list "root branch stores child max keys" [ 31; 63; 95; 100 ] keys;
+     assert_equal_list "root branch stores child addresses" [ "node-1"; "node-2"; "node-3"; "node-4" ] child_addresses
+   | Some _ -> failwith "large root should be a branch node"
+   | None -> failwith "large root address should be stored");
+  assert_equal_int "large restore construction stays lazy" 0 !reads;
+  (match restore ~cmp:compare storage root with
+   | Some restored ->
+     assert_equal_int "large restore does not read before access" 0 !reads;
+     assert_equal_list "large restore round-trips values" (to_list original) (to_list restored)
+   | None -> failwith "large restore should find the stored root");
+  assert_equal_int "large restored access reads branch and leaves" 5 !reads;
+  assert_equal_list "large restored access marks branch and leaves accessed" [ "node-4"; "node-3"; "node-2"; "node-1"; root ] !accessed;
+  let appended = add 101 stored in
+  let appended_root, appended_stored = store storage appended in
+  if appended_root = root then failwith "appending to a stored set should create a new root";
+  assert_equal_int "append writes one changed leaf and one new branch" 7 !writes;
+  assert_equal_list
+    "append reuses unchanged leaf addresses"
+    [ appended_root; "node-1"; "node-2"; "node-3"; "node-6" ]
+    (walk_addresses appended_stored);
+  (match Hashtbl.find_opt memory appended_root with
+   | Some (Branch (_, child_addresses)) ->
+     assert_equal_list "appended root reuses unchanged leaves" [ "node-1"; "node-2"; "node-3"; "node-6" ] child_addresses
+   | Some _ -> failwith "appended root should be a branch node"
+   | None -> failwith "appended root address should be stored")
+
+let test_storage_remove_preserves_unchanged_leaf_addresses () =
+  let memory = Hashtbl.create 16 in
+  let writes = ref 0 in
+  let storage =
+    { store_node =
+        (fun node ->
+          incr writes;
+          let address = "node-" ^ string_of_int !writes in
+          Hashtbl.replace memory address node;
+          address)
+    ; restore_node = (fun address -> Hashtbl.find_opt memory address)
+    ; accessed = (fun _ -> ())
+    }
+  in
+  let original = of_list (irange 0 100) in
+  let root, stored = store storage original in
+  assert_equal_int "large store writes leaf nodes plus a root" 5 !writes;
+  let removed = remove 50 stored in
+  let removed_root, removed_stored = store storage removed in
+  if removed_root = root then failwith "removing a value should create a new root address";
+  assert_equal_int "removing from one leaf rewrites one leaf and one root" 7 !writes;
+  assert_equal_list
+    "remove reuses unaffected leaf addresses"
+    [ removed_root; "node-1"; "node-6"; "node-3"; "node-4" ]
+    (walk_addresses removed_stored);
+  (match Hashtbl.find_opt memory removed_root with
+   | Some (Branch (_, child_addresses)) ->
+     assert_equal_list
+       "removed root points at reused sibling leaves"
+       [ "node-1"; "node-6"; "node-3"; "node-4" ]
+       child_addresses
+   | Some _ -> failwith "removed root should be a branch node"
+   | None -> failwith "removed root address should be stored");
+  (match Hashtbl.find_opt memory "node-6" with
+   | Some (Leaf values) ->
+     assert_equal_list "changed leaf only drops the removed value" (irange 32 49 @ irange 51 63) values
+   | Some _ -> failwith "changed node should be a leaf"
+   | None -> failwith "changed leaf address should be stored");
+  assert_equal_list "removed stored set keeps sorted values" (irange 0 49 @ irange 51 100) (to_list removed_stored)
+
+let test_storage_add_preserves_unchanged_leaf_addresses () =
+  let memory = Hashtbl.create 16 in
+  let writes = ref 0 in
+  let storage =
+    { store_node =
+        (fun node ->
+          incr writes;
+          let address = "node-" ^ string_of_int !writes in
+          Hashtbl.replace memory address node;
+          address)
+    ; restore_node = (fun address -> Hashtbl.find_opt memory address)
+    ; accessed = (fun _ -> ())
+    }
+  in
+  let original = of_list (irange 0 49 @ irange 51 100) in
+  let root, stored = store storage original in
+  assert_equal_int "large gapped store writes leaf nodes plus a root" 5 !writes;
+  let added = add 50 stored in
+  let added_root, added_stored = store storage added in
+  if added_root = root then failwith "adding a value should create a new root address";
+  assert_equal_int "adding into one full leaf rewrites split leaves and one root" 8 !writes;
+  assert_equal_list
+    "add reuses unaffected leaf addresses"
+    [ added_root; "node-1"; "node-6"; "node-7"; "node-3"; "node-4" ]
+    (walk_addresses added_stored);
+  (match Hashtbl.find_opt memory added_root with
+   | Some (Branch (_, child_addresses)) ->
+     assert_equal_list
+       "added root points at reused sibling leaves"
+       [ "node-1"; "node-6"; "node-7"; "node-3"; "node-4" ]
+       child_addresses
+   | Some _ -> failwith "added root should be a branch node"
+   | None -> failwith "added root address should be stored");
+  (match Hashtbl.find_opt memory "node-6", Hashtbl.find_opt memory "node-7" with
+   | Some (Leaf left), Some (Leaf right) ->
+     assert_equal_list "split left leaf contains the lower local values" (irange 32 63) left;
+     assert_equal_list "split right leaf contains the upper local values" [ 64 ] right
+   | _ -> failwith "changed leaf should split into two new leaves");
+  assert_equal_list "added stored set keeps sorted values" (irange 0 100) (to_list added_stored)
+
+let test_restored_add_preserves_unchanged_leaf_addresses_lazily () =
+  let memory = Hashtbl.create 16 in
+  let writes = ref 0 in
+  let reads = ref 0 in
+  let accessed = ref [] in
+  let storage =
+    { store_node =
+        (fun node ->
+          incr writes;
+          let address = "node-" ^ string_of_int !writes in
+          Hashtbl.replace memory address node;
+          address)
+    ; restore_node =
+        (fun address ->
+          incr reads;
+          Hashtbl.find_opt memory address)
+    ; accessed = (fun address -> accessed := address :: !accessed)
+    }
+  in
+  let original = of_list (irange 0 100) in
+  let root, _ = store storage original in
+  reads := 0;
+  accessed := [];
+  let restored =
+    match restore ~cmp:compare storage root with
+    | Some restored -> restored
+    | None -> failwith "restore should find the stored root"
+  in
+  let appended = add 101 restored in
+  assert_equal_int "restored add should read only root and target leaf" 2 !reads;
+  assert_equal_list "restored add should access only root and target leaf" [ "node-4"; root ] !accessed;
+  let appended_root, appended_stored = store storage appended in
+  if appended_root = root then failwith "restored add should create a new root";
+  assert_equal_int "restored add should write one changed leaf and one new root" 7 !writes;
+  assert_equal_list
+    "restored add reuses unchanged leaf addresses"
+    [ appended_root; "node-1"; "node-2"; "node-3"; "node-6" ]
+    (walk_addresses appended_stored);
+  assert_equal_list "restored add keeps sorted values" (irange 0 101) (to_list appended_stored)
+
+let test_restored_remove_preserves_unchanged_leaf_addresses_lazily () =
+  let memory = Hashtbl.create 16 in
+  let writes = ref 0 in
+  let reads = ref 0 in
+  let accessed = ref [] in
+  let storage =
+    { store_node =
+        (fun node ->
+          incr writes;
+          let address = "node-" ^ string_of_int !writes in
+          Hashtbl.replace memory address node;
+          address)
+    ; restore_node =
+        (fun address ->
+          incr reads;
+          Hashtbl.find_opt memory address)
+    ; accessed = (fun address -> accessed := address :: !accessed)
+    }
+  in
+  let original = of_list (irange 0 100) in
+  let root, _ = store storage original in
+  reads := 0;
+  accessed := [];
+  let restored =
+    match restore ~cmp:compare storage root with
+    | Some restored -> restored
+    | None -> failwith "restore should find the stored root"
+  in
+  let removed = remove 50 restored in
+  assert_equal_int "restored remove should read only root and target leaf" 2 !reads;
+  assert_equal_list "restored remove should access only root and target leaf" [ "node-2"; root ] !accessed;
+  let removed_root, removed_stored = store storage removed in
+  if removed_root = root then failwith "restored remove should create a new root";
+  assert_equal_int "restored remove should write one changed leaf and one new root" 7 !writes;
+  assert_equal_list
+    "restored remove reuses unchanged leaf addresses"
+    [ removed_root; "node-1"; "node-6"; "node-3"; "node-4" ]
+    (walk_addresses removed_stored);
+  assert_equal_list "restored remove keeps sorted values" (irange 0 49 @ irange 51 100) (to_list removed_stored)
+
+let test_restored_mem_reads_only_needed_leaves () =
+  let memory = Hashtbl.create 16 in
+  let writes = ref 0 in
+  let reads = ref 0 in
+  let accessed = ref [] in
+  let storage =
+    { store_node =
+        (fun node ->
+          incr writes;
+          let address = "node-" ^ string_of_int !writes in
+          Hashtbl.replace memory address node;
+          address)
+    ; restore_node =
+        (fun address ->
+          incr reads;
+          Hashtbl.find_opt memory address)
+    ; accessed = (fun address -> accessed := address :: !accessed)
+    }
+  in
+  let original = of_list (irange 0 100) in
+  let root, _ = store storage original in
+  let restored =
+    match restore ~cmp:compare storage root with
+    | Some restored -> restored
+    | None -> failwith "restore should find the stored root"
+  in
+  if not (mem 5 restored) then failwith "mem should find values in a restored set";
+  assert_equal_int "restored mem should read only root and matching leaf" 2 !reads;
+  assert_equal_list "restored mem should access only root and matching leaf" [ "node-1"; root ] !accessed;
+  reads := 0;
+  accessed := [];
+  if not (mem 40 restored) then failwith "mem should find values after skipping earlier leaves";
+  assert_equal_int "restored mem should use branch keys to skip irrelevant leaves" 2 !reads;
+  assert_equal_list "restored mem should access only root and matching later leaf" [ "node-2"; root ] !accessed;
+  reads := 0;
+  accessed := [];
+  if mem (-1) restored then failwith "mem should reject values below the first leaf";
+  assert_equal_int "restored mem should stop after first leaf for lower misses" 2 !reads;
+  assert_equal_list "restored mem lower miss should access root and first leaf" [ "node-1"; root ] !accessed
+
+let test_restored_slice_reads_only_overlapping_leaves () =
+  let memory = Hashtbl.create 16 in
+  let writes = ref 0 in
+  let reads = ref 0 in
+  let accessed = ref [] in
+  let storage =
+    { store_node =
+        (fun node ->
+          incr writes;
+          let address = "node-" ^ string_of_int !writes in
+          Hashtbl.replace memory address node;
+          address)
+    ; restore_node =
+        (fun address ->
+          incr reads;
+          Hashtbl.find_opt memory address)
+    ; accessed = (fun address -> accessed := address :: !accessed)
+    }
+  in
+  let original = of_list (irange 0 100) in
+  let root, _ = store storage original in
+  let restored =
+    match restore ~cmp:compare storage root with
+    | Some restored -> restored
+    | None -> failwith "restore should find the stored root"
+  in
+  assert_equal_list "restored slice returns values from one leaf" (irange 40 42) (slice ~from_:40 ~to_:42 restored);
+  assert_equal_int "restored slice should read root and one overlapping leaf" 2 !reads;
+  assert_equal_list "restored slice should access only root and one leaf" [ "node-2"; root ] !accessed;
+  reads := 0;
+  accessed := [];
+  assert_equal_list
+    "restored slice returns values across adjacent leaves"
+    (irange 62 65)
+    (slice ~from_:62 ~to_:65 restored);
+  assert_equal_int "restored slice across boundary should read root and two leaves" 3 !reads;
+  assert_equal_list "restored slice across boundary should access root and two leaves" [ "node-3"; "node-2"; root ] !accessed
+
+let test_restored_reverse_slice_reads_only_overlapping_leaves () =
+  let memory = Hashtbl.create 16 in
+  let writes = ref 0 in
+  let reads = ref 0 in
+  let accessed = ref [] in
+  let storage =
+    { store_node =
+        (fun node ->
+          incr writes;
+          let address = "node-" ^ string_of_int !writes in
+          Hashtbl.replace memory address node;
+          address)
+    ; restore_node =
+        (fun address ->
+          incr reads;
+          Hashtbl.find_opt memory address)
+    ; accessed = (fun address -> accessed := address :: !accessed)
+    }
+  in
+  let original = of_list (irange 0 100) in
+  let root, _ = store storage original in
+  let restored =
+    match restore ~cmp:compare storage root with
+    | Some restored -> restored
+    | None -> failwith "restore should find the stored root"
+  in
+  assert_equal_list "restored reverse slice returns values from one leaf" (irange 42 40) (rslice ~from_:42 ~to_:40 restored);
+  assert_equal_int "restored reverse slice should read root and one overlapping leaf" 2 !reads;
+  assert_equal_list "restored reverse slice should access only root and one leaf" [ "node-2"; root ] !accessed;
+  reads := 0;
+  accessed := [];
+  assert_equal_list
+    "restored reverse slice returns values across adjacent leaves"
+    (irange 65 62)
+    (rslice ~from_:65 ~to_:62 restored);
+  assert_equal_int "restored reverse slice across boundary should read root and two leaves" 3 !reads;
+  assert_equal_list "restored reverse slice across boundary should access root and two leaves" [ "node-2"; "node-3"; root ] !accessed
+
+let test_restored_seq_seek_is_lazy () =
+  let memory = Hashtbl.create 16 in
+  let writes = ref 0 in
+  let reads = ref 0 in
+  let accessed = ref [] in
+  let storage =
+    { store_node =
+        (fun node ->
+          incr writes;
+          let address = "node-" ^ string_of_int !writes in
+          Hashtbl.replace memory address node;
+          address)
+    ; restore_node =
+        (fun address ->
+          incr reads;
+          Hashtbl.find_opt memory address)
+    ; accessed = (fun address -> accessed := address :: !accessed)
+    }
+  in
+  let root, _ = store storage (of_list (irange 0 100)) in
+  let restored =
+    match restore ~cmp:compare storage root with
+    | Some restored -> restored
+    | None -> failwith "restore should find the stored root"
+  in
+  let sequence = seq restored in
+  assert_equal_int "seq construction should not read restored storage" 0 !reads;
+  assert_equal_list "seq construction should not access restored storage" [] !accessed;
+  assert_equal_list "seeked restored seq returns the requested suffix" (irange 40 100) (sequence |> seek 40 |> seq_to_list);
+  assert_equal_int "seeked restored seq should skip leaves before the seek key" 4 !reads;
+  assert_equal_list "seeked restored seq should access root and suffix leaves" [ "node-4"; "node-3"; "node-2"; root ] !accessed
+
+let test_restored_rseq_seek_is_lazy () =
+  let memory = Hashtbl.create 16 in
+  let writes = ref 0 in
+  let reads = ref 0 in
+  let accessed = ref [] in
+  let storage =
+    { store_node =
+        (fun node ->
+          incr writes;
+          let address = "node-" ^ string_of_int !writes in
+          Hashtbl.replace memory address node;
+          address)
+    ; restore_node =
+        (fun address ->
+          incr reads;
+          Hashtbl.find_opt memory address)
+    ; accessed = (fun address -> accessed := address :: !accessed)
+    }
+  in
+  let root, _ = store storage (of_list (irange 0 100)) in
+  let restored =
+    match restore ~cmp:compare storage root with
+    | Some restored -> restored
+    | None -> failwith "restore should find the stored root"
+  in
+  let sequence = rseq restored in
+  assert_equal_int "rseq construction should not read restored storage" 0 !reads;
+  assert_equal_list "rseq construction should not access restored storage" [] !accessed;
+  assert_equal_list "seeked restored rseq returns the requested suffix" (irange 65 0) (sequence |> seek 65 |> seq_to_list);
+  assert_equal_int "seeked restored rseq should skip leaves above the seek key" 4 !reads;
+  assert_equal_list "seeked restored rseq should access root and suffix leaves" [ "node-1"; "node-2"; "node-3"; root ] !accessed
+
+let test_restored_slice_seq_construction_is_lazy () =
+  let memory = Hashtbl.create 16 in
+  let writes = ref 0 in
+  let reads = ref 0 in
+  let accessed = ref [] in
+  let storage =
+    { store_node =
+        (fun node ->
+          incr writes;
+          let address = "node-" ^ string_of_int !writes in
+          Hashtbl.replace memory address node;
+          address)
+    ; restore_node =
+        (fun address ->
+          incr reads;
+          Hashtbl.find_opt memory address)
+    ; accessed = (fun address -> accessed := address :: !accessed)
+    }
+  in
+  let root, _ = store storage (of_list (irange 0 100)) in
+  let restored =
+    match restore ~cmp:compare storage root with
+    | Some restored -> restored
+    | None -> failwith "restore should find the stored root"
+  in
+  let sequence = slice_seq ~from_:40 ~to_:65 restored in
+  assert_equal_int "slice_seq construction should not read restored storage" 0 !reads;
+  assert_equal_list "slice_seq construction should not access restored storage" [] !accessed;
+  assert_equal_list
+    "seeked restored slice_seq stays inside the original slice"
+    (irange 62 65)
+    (sequence |> seek 62 |> seq_to_list);
+  assert_equal_int "seeked restored slice_seq should read only overlapping suffix leaves" 3 !reads;
+  assert_equal_list "seeked restored slice_seq should access root and overlapping suffix leaves" [ "node-3"; "node-2"; root ] !accessed
+
+let test_restored_rslice_seq_construction_is_lazy () =
+  let memory = Hashtbl.create 16 in
+  let writes = ref 0 in
+  let reads = ref 0 in
+  let accessed = ref [] in
+  let storage =
+    { store_node =
+        (fun node ->
+          incr writes;
+          let address = "node-" ^ string_of_int !writes in
+          Hashtbl.replace memory address node;
+          address)
+    ; restore_node =
+        (fun address ->
+          incr reads;
+          Hashtbl.find_opt memory address)
+    ; accessed = (fun address -> accessed := address :: !accessed)
+    }
+  in
+  let root, _ = store storage (of_list (irange 0 100)) in
+  let restored =
+    match restore ~cmp:compare storage root with
+    | Some restored -> restored
+    | None -> failwith "restore should find the stored root"
+  in
+  let sequence = rslice_seq ~from_:65 ~to_:40 restored in
+  assert_equal_int "rslice_seq construction should not read restored storage" 0 !reads;
+  assert_equal_list "rslice_seq construction should not access restored storage" [] !accessed;
+  assert_equal_list
+    "seeked restored rslice_seq stays inside the original slice"
+    (irange 42 40)
+    (sequence |> seek 42 |> seq_to_list);
+  assert_equal_int "seeked restored rslice_seq should read only overlapping suffix leaf" 2 !reads;
+  assert_equal_list "seeked restored rslice_seq should access root and overlapping suffix leaf" [ "node-2"; root ] !accessed
+
+let test_storage_uses_nested_branch_nodes_for_very_large_sets () =
+  let memory = Hashtbl.create 64 in
+  let writes = ref 0 in
+  let reads = ref 0 in
+  let storage =
+    { store_node =
+        (fun node ->
+          incr writes;
+          let address = "node-" ^ string_of_int !writes in
+          Hashtbl.replace memory address node;
+          address)
+    ; restore_node =
+        (fun address ->
+          incr reads;
+          Hashtbl.find_opt memory address)
+    ; accessed = (fun _ -> ())
+    }
+  in
+  let original = of_list (irange 0 1055) in
+  let root, stored = store storage original in
+  assert_equal_int "very large store writes leaves, intermediate branches, and root" 36 !writes;
+  if root <> "node-36" then failwith "very large root should be written after intermediate branches";
+  assert_equal_int "walk_addresses includes root and every stored descendant" 36 (List.length (walk_addresses stored));
+  (match Hashtbl.find_opt memory root with
+   | Some (Branch (keys, child_addresses)) ->
+     assert_equal_list "root branch stores intermediate max keys" [ 1023; 1055 ] keys;
+     assert_equal_list "root branch points to intermediate branches" [ "node-34"; "node-35" ] child_addresses
+   | Some _ -> failwith "very large root should be a branch node"
+   | None -> failwith "very large root address should be stored");
+  (match Hashtbl.find_opt memory "node-34" with
+   | Some (Branch (keys, child_addresses)) ->
+     assert_equal_list
+       "first intermediate branch stores leaf max keys"
+       (List.init 32 (fun index -> ((index + 1) * 32) - 1))
+       keys;
+     assert_equal_list
+       "first intermediate branch points to the first leaf group"
+       (List.init 32 (fun index -> "node-" ^ string_of_int (index + 1)))
+       child_addresses
+   | Some _ -> failwith "first intermediate node should be a branch"
+   | None -> failwith "first intermediate branch should be stored");
+  (match Hashtbl.find_opt memory "node-35" with
+   | Some (Branch (keys, child_addresses)) ->
+     assert_equal_list "second intermediate branch stores remaining leaf max key" [ 1055 ] keys;
+     assert_equal_list "second intermediate branch points to the remaining leaf" [ "node-33" ] child_addresses
+   | Some _ -> failwith "second intermediate node should be a branch"
+   | None -> failwith "second intermediate branch should be stored");
+  (match restore ~cmp:compare storage root with
+   | Some restored ->
+     assert_equal_int "very large restore stays lazy before access" 0 !reads;
+     assert_equal_list "very large restore round-trips values" (to_list original) (to_list restored)
+   | None -> failwith "very large restore should find the stored root");
+  assert_equal_int "very large restored access reads every branch and leaf" 36 !reads
+
+let test_nested_storage_remove_reuses_unchanged_branch_addresses () =
+  let memory = Hashtbl.create 64 in
+  let writes = ref 0 in
+  let storage =
+    { store_node =
+        (fun node ->
+          incr writes;
+          let address = "node-" ^ string_of_int !writes in
+          Hashtbl.replace memory address node;
+          address)
+    ; restore_node = (fun address -> Hashtbl.find_opt memory address)
+    ; accessed = (fun _ -> ())
+    }
+  in
+  let original = of_list (irange 0 1055) in
+  let root, stored = store storage original in
+  if root <> "node-36" then failwith "initial nested root should be node-36";
+  let removed = remove 50 stored in
+  let removed_root, removed_stored = store storage removed in
+  if removed_root = root then failwith "nested remove should create a new root address";
+  assert_equal_int "nested remove rewrites changed leaf, one branch, and root" 39 !writes;
+  if removed_root <> "node-39" then failwith "nested remove root should be the third new node";
+  (match Hashtbl.find_opt memory removed_root with
+   | Some (Branch (keys, child_addresses)) ->
+     assert_equal_list "nested remove root keeps old second branch max key" [ 1023; 1055 ] keys;
+     assert_equal_list "nested remove root reuses unchanged second branch" [ "node-38"; "node-35" ] child_addresses
+   | Some _ -> failwith "nested remove root should be a branch"
+   | None -> failwith "nested remove root should be stored");
+  (match Hashtbl.find_opt memory "node-38" with
+   | Some (Branch (_, child_addresses)) ->
+     let expected =
+       List.init 32 (fun index ->
+         if index = 1 then "node-37" else "node-" ^ string_of_int (index + 1))
+     in
+     assert_equal_list "nested remove rewrites only the changed leaf address" expected child_addresses
+   | Some _ -> failwith "nested remove first branch should be a branch"
+   | None -> failwith "nested remove changed branch should be stored");
+  assert_equal_list "nested remove keeps sorted values" (irange 0 49 @ irange 51 1055) (to_list removed_stored)
+
+let test_restored_nested_remove_reuses_unchanged_branch_addresses_lazily () =
+  let memory = Hashtbl.create 64 in
+  let writes = ref 0 in
+  let reads = ref 0 in
+  let accessed = ref [] in
+  let storage =
+    { store_node =
+        (fun node ->
+          incr writes;
+          let address = "node-" ^ string_of_int !writes in
+          Hashtbl.replace memory address node;
+          address)
+    ; restore_node =
+        (fun address ->
+          incr reads;
+          Hashtbl.find_opt memory address)
+    ; accessed = (fun address -> accessed := address :: !accessed)
+    }
+  in
+  let root, _ = store storage (of_list (irange 0 1055)) in
+  reads := 0;
+  accessed := [];
+  let restored =
+    match restore ~cmp:compare storage root with
+    | Some restored -> restored
+    | None -> failwith "restore should find the stored root"
+  in
+  let removed = remove 50 restored in
+  assert_equal_int "restored nested remove should read root, changed branch, and changed leaf" 3 !reads;
+  assert_equal_list
+    "restored nested remove should access only the changed path"
+    [ "node-2"; "node-34"; root ]
+    !accessed;
+  let removed_root, removed_stored = store storage removed in
+  if removed_root = root then failwith "restored nested remove should create a new root address";
+  assert_equal_int "restored nested remove rewrites changed leaf, one branch, and root" 39 !writes;
+  if removed_root <> "node-39" then failwith "restored nested remove root should be the third new node";
+  (match Hashtbl.find_opt memory removed_root with
+   | Some (Branch (keys, child_addresses)) ->
+     assert_equal_list "restored nested remove root keeps old second branch max key" [ 1023; 1055 ] keys;
+     assert_equal_list "restored nested remove root reuses unchanged second branch" [ "node-38"; "node-35" ] child_addresses
+   | Some _ -> failwith "restored nested remove root should be a branch"
+   | None -> failwith "restored nested remove root should be stored");
+  assert_equal_list "restored nested remove keeps sorted values" (irange 0 49 @ irange 51 1055) (to_list removed_stored)
+
+let test_restored_nested_add_reuses_unchanged_branch_addresses_lazily () =
+  let memory = Hashtbl.create 64 in
+  let writes = ref 0 in
+  let reads = ref 0 in
+  let accessed = ref [] in
+  let storage =
+    { store_node =
+        (fun node ->
+          incr writes;
+          let address = "node-" ^ string_of_int !writes in
+          Hashtbl.replace memory address node;
+          address)
+    ; restore_node =
+        (fun address ->
+          incr reads;
+          Hashtbl.find_opt memory address)
+    ; accessed = (fun address -> accessed := address :: !accessed)
+    }
+  in
+  let original_values = irange 0 49 @ irange 51 1055 in
+  let root, _ = store storage (of_list original_values) in
+  reads := 0;
+  accessed := [];
+  let restored =
+    match restore ~cmp:compare storage root with
+    | Some restored -> restored
+    | None -> failwith "restore should find the stored root"
+  in
+  let added = add 50 restored in
+  assert_equal_int "restored nested add should read root, changed branch, and changed leaf" 3 !reads;
+  assert_equal_list
+    "restored nested add should access only the changed path"
+    [ "node-2"; "node-34"; root ]
+    !accessed;
+  let added_root, added_stored = store storage added in
+  if added_root = root then failwith "restored nested add should create a new root address";
+  assert_equal_int "restored nested add rewrites split leaves, split branches, and root" 41 !writes;
+  if added_root <> "node-41" then failwith "restored nested add root should be the fifth new node";
+  (match Hashtbl.find_opt memory added_root with
+   | Some (Branch (keys, child_addresses)) ->
+     assert_equal_list "restored nested add root updates split first branch max keys" [ 992; 1024; 1055 ] keys;
+     assert_equal_list "restored nested add root reuses unchanged second branch" [ "node-39"; "node-40"; "node-35" ] child_addresses
+   | Some _ -> failwith "restored nested add root should be a branch"
+   | None -> failwith "restored nested add root should be stored");
+  assert_equal_list "restored nested add keeps sorted values" (irange 0 1055) (to_list added_stored)
+
+let () =
+  test_sorted_order_and_uniqueness ();
+  test_custom_comparator_and_override_compare ();
+  test_equal_comparator_slice_ranges ();
+  test_restored_equal_comparator_slice_ranges ();
+  test_pair_comparator_nil_wildcard_slices ();
+  test_slice_boundaries ();
+  test_reverse_slice_boundaries ();
+  test_seek ();
+  test_slice_sequences_are_seekable_and_reversible ();
+  test_fold_reduces_sets_and_sequences ();
+  test_storage_round_trip_and_stable_addresses ();
+  test_storage_uses_leaf_and_branch_nodes_for_large_sets ();
+  test_storage_remove_preserves_unchanged_leaf_addresses ();
+  test_storage_add_preserves_unchanged_leaf_addresses ();
+  test_restored_add_preserves_unchanged_leaf_addresses_lazily ();
+  test_restored_remove_preserves_unchanged_leaf_addresses_lazily ();
+  test_restored_mem_reads_only_needed_leaves ();
+  test_restored_slice_reads_only_overlapping_leaves ();
+  test_restored_reverse_slice_reads_only_overlapping_leaves ();
+  test_restored_seq_seek_is_lazy ();
+  test_restored_rseq_seek_is_lazy ();
+  test_restored_slice_seq_construction_is_lazy ();
+  test_restored_rslice_seq_construction_is_lazy ();
+  test_storage_uses_nested_branch_nodes_for_very_large_sets ();
+  test_nested_storage_remove_reuses_unchanged_branch_addresses ();
+  test_restored_nested_remove_reuses_unchanged_branch_addresses_lazily ();
+  test_restored_nested_add_reuses_unchanged_branch_addresses_lazily ()
