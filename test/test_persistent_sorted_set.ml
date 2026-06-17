@@ -154,7 +154,92 @@ let test_pair_comparator_nil_wildcard_slices () =
   assert_equal_list
     "wildcard slice handles non-matching subrange"
     [ Some "a", Some "d"; Some "b", Some "q" ]
-    (slice ~from_:(Some "a", Some "c") ~to_:(Some "b", Some "r") set)
+    (slice ~from_:(Some "a", Some "c") ~to_:(Some "b", Some "r") set);
+  assert_equal_list
+    "wildcard slice includes later values for an open non-matching upper tuple"
+    [ Some "b", Some "x" ]
+    (slice ~from_:(Some "b", Some "r") ~to_:(Some "c", None) set);
+  assert_equal_list
+    "wildcard slice returns empty values for an out-of-range tuple bucket"
+    []
+    (slice ~from_:(Some "c", None) ~to_:(Some "c", None) set)
+
+let test_upstream_fractional_slice_boundaries () =
+  let float_range from_ to_ =
+    irange from_ to_ |> List.map float_of_int
+  in
+  let assert_float_slice label ?from_ ?to_ expected set =
+    assert_equal_list label expected (slice ?from_ ?to_ set)
+  in
+  let assert_float_rslice label ?from_ ?to_ expected set =
+    assert_equal_list label expected (rslice ?from_ ?to_ set)
+  in
+  let large = of_list (float_range 0 5000 |> shuffled) in
+  assert_float_slice
+    "upstream slice lower bound between keys skips earlier values"
+    ~from_:0.5
+    (float_range 1 5000)
+    large;
+  assert_float_slice
+    "upstream slice upper bound between keys stops before following values"
+    ~to_:4999.5
+    (float_range 0 4999)
+    large;
+  assert_float_slice
+    "upstream slice fractional middle range includes only matching values"
+    ~from_:2499.5
+    ~to_:2500.5
+    [ 2500.0 ]
+    large;
+  assert_float_slice
+    "upstream slice fractional gap with no members is empty"
+    ~from_:2500.1
+    ~to_:2500.9
+    []
+    large;
+  assert_float_rslice
+    "upstream reverse slice lower bound between keys skips higher values"
+    ~from_:4999.5
+    (float_range 4999 0)
+    large;
+  assert_float_rslice
+    "upstream reverse slice upper bound between keys stops before lower values"
+    ~to_:0.5
+    (float_range 5000 1)
+    large;
+  assert_float_rslice
+    "upstream reverse slice fractional middle range includes only matching values"
+    ~from_:2500.5
+    ~to_:2499.5
+    [ 2500.0 ]
+    large;
+  assert_float_rslice
+    "upstream reverse slice fractional gap with no members is empty"
+    ~from_:2500.9
+    ~to_:2500.1
+    []
+    large;
+  let small = of_list (float_range 0 10 |> List.rev) in
+  assert_float_slice
+    "upstream one-leaf slice handles fractional lower bounds"
+    ~from_:0.5
+    (float_range 1 10)
+    small;
+  assert_float_slice
+    "upstream one-leaf slice handles fractional upper bounds"
+    ~to_:9.5
+    (float_range 0 9)
+    small;
+  assert_float_rslice
+    "upstream one-leaf reverse slice handles fractional lower bounds"
+    ~from_:9.5
+    (float_range 9 0)
+    small;
+  assert_float_rslice
+    "upstream one-leaf reverse slice handles fractional upper bounds"
+    ~to_:0.5
+    (float_range 10 1)
+    small
 
 let test_slice_boundaries () =
   let set = of_list (shuffled (irange 0 5000)) in
@@ -936,6 +1021,7 @@ let () =
   test_equal_comparator_slice_ranges ();
   test_restored_equal_comparator_slice_ranges ();
   test_pair_comparator_nil_wildcard_slices ();
+  test_upstream_fractional_slice_boundaries ();
   test_slice_boundaries ();
   test_reverse_slice_boundaries ();
   test_seek ();
