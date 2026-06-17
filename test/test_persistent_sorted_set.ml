@@ -5,8 +5,22 @@ let failf fmt = Printf.ksprintf failwith fmt
 let assert_equal_list label expected actual =
   if expected <> actual then failf "%s: unexpected list" label
 
+let assert_equal_string_list label expected actual =
+  if expected <> actual then
+    failf
+      "%s: expected [%s], got [%s]"
+      label
+      (String.concat "; " expected)
+      (String.concat "; " actual)
+
 let assert_equal_int label expected actual =
   if expected <> actual then failf "%s: expected %d, got %d" label expected actual
+
+let assert_raises_invalid_arg label f =
+  match f () with
+  | exception Invalid_argument _ -> ()
+  | exception exn -> failf "%s: expected Invalid_argument, got %s" label (Printexc.to_string exn)
+  | _ -> failf "%s: expected Invalid_argument" label
 
 let irange from_ to_ =
   let rec loop acc current =
@@ -35,6 +49,113 @@ let compare_pair_with_nil_wildcard (x0, x1) (y0, y1) =
   | _ -> 1
 
 let quotient_compare divisor left right = compare (left / divisor) (right / divisor)
+
+let test_settings_control_storage_branching_factor () =
+  let memory = Hashtbl.create 16 in
+  let writes = ref 0 in
+  let storage =
+    { store_node =
+        (fun node ->
+          incr writes;
+          let address = "node-" ^ string_of_int !writes in
+          Hashtbl.replace memory address node;
+          address)
+    ; restore_node = (fun address -> Hashtbl.find_opt memory address)
+    ; accessed = (fun _ -> ())
+    }
+  in
+  let custom_settings = { branching_factor = 4 } in
+  let set = of_list_by ~settings:custom_settings compare (irange 0 9) in
+  if settings set <> custom_settings then failwith "settings should expose custom branching factor";
+  let root, stored = store storage set in
+  assert_equal_int "custom branching factor controls leaf count" 4 !writes;
+  assert_equal_string_list
+    "walk_addresses reports root and custom-sized leaves"
+    [ root; "node-1"; "node-2"; "node-3" ]
+    (walk_addresses stored);
+  (match Hashtbl.find_opt memory root with
+   | Some (Branch (keys, child_addresses)) ->
+     assert_equal_list "root branch keys use custom leaf boundaries" [ 3; 7; 9 ] keys;
+     assert_equal_list "root branch addresses use custom leaf boundaries" [ "node-1"; "node-2"; "node-3" ] child_addresses
+   | Some _ -> failwith "custom branching factor should create a branch root"
+   | None -> failwith "custom root should be stored");
+  if settings (empty ()) <> default_settings then failwith "empty should use default settings";
+  let default_root, _ = store storage (of_list (irange 0 9)) in
+  (match Hashtbl.find_opt memory default_root with
+   | Some (Leaf values) -> assert_equal_list "default branching factor keeps small sets in one leaf" (irange 0 9) values
+   | Some _ -> failwith "default branching factor should keep ten values in one leaf"
+   | None -> failwith "default root should be stored")
+
+let test_restore_preserves_settings_for_later_edits () =
+  let memory = Hashtbl.create 16 in
+  let writes = ref 0 in
+  let reads = ref 0 in
+  let accessed = ref [] in
+  let storage =
+    { store_node =
+        (fun node ->
+          incr writes;
+          let address = "node-" ^ string_of_int !writes in
+          Hashtbl.replace memory address node;
+          address)
+    ; restore_node =
+        (fun address ->
+          incr reads;
+          Hashtbl.find_opt memory address)
+    ; accessed = (fun address -> accessed := address :: !accessed)
+    }
+  in
+  let custom_settings = { branching_factor = 4 } in
+  let root, _ = store storage (of_list_by ~settings:custom_settings compare (irange 0 15)) in
+  assert_equal_int "custom restore setup writes four leaves plus root" 5 !writes;
+  reads := 0;
+  accessed := [];
+  let restored =
+    match restore ~cmp:compare ~settings:custom_settings storage root with
+    | Some restored -> restored
+    | None -> failwith "restore should find the custom stored root"
+  in
+  if settings restored <> custom_settings then failwith "restore should remember supplied settings";
+  let added = add 16 restored in
+  assert_equal_int "custom restored add reads only root and target leaf" 2 !reads;
+  assert_equal_string_list "custom restored add accesses only root and target leaf" [ "node-4"; root ] !accessed;
+  let added_root, added_stored = store storage added in
+  if added_root = root then failwith "custom restored add should create a new root";
+  assert_equal_int "custom restored add splits leaves and branch levels by restored branching factor" 10 !writes;
+  assert_equal_string_list
+    "custom restored add reuses unchanged leaves and stores split branch levels"
+    [ added_root; "node-7"; "node-1"; "node-2"; "node-3"; "node-6"; "node-9"; "node-8" ]
+    (walk_addresses added_stored);
+  (match Hashtbl.find_opt memory added_root with
+   | Some (Branch (keys, child_addresses)) ->
+     assert_equal_list "custom restored add root keys follow branching factor" [ 15; 16 ] keys;
+     assert_equal_list
+       "custom restored add root addresses point at split branch nodes"
+       [ "node-7"; "node-9" ]
+       child_addresses
+   | Some _ -> failwith "custom restored add root should be a branch"
+   | None -> failwith "custom restored add root should be stored")
+
+let test_settings_validate_branching_factor () =
+  assert_raises_invalid_arg
+    "empty_by rejects branching factors below two"
+    (fun () -> ignore (empty_by ~settings:{ branching_factor = 1 } compare));
+  assert_raises_invalid_arg
+    "of_list_by rejects non-positive branching factors"
+    (fun () -> ignore (of_list_by ~settings:{ branching_factor = 0 } compare [ 1; 2; 3 ]));
+  let memory = Hashtbl.create 1 in
+  let storage =
+    { store_node =
+        (fun node ->
+          Hashtbl.replace memory "root" node;
+          "root")
+    ; restore_node = (fun address -> Hashtbl.find_opt memory address)
+    ; accessed = (fun _ -> ())
+    }
+  in
+  assert_raises_invalid_arg
+    "restore rejects invalid branching factors"
+    (fun () -> ignore (restore ~cmp:compare ~settings:{ branching_factor = 1 } storage "root"))
 
 let test_sorted_order_and_uniqueness () =
   let set = of_list (List.rev (irange 10 20)) in
@@ -1016,6 +1137,9 @@ let test_restored_nested_add_reuses_unchanged_branch_addresses_lazily () =
   assert_equal_list "restored nested add keeps sorted values" (irange 0 1055) (to_list added_stored)
 
 let () =
+  test_settings_control_storage_branching_factor ();
+  test_restore_preserves_settings_for_later_edits ();
+  test_settings_validate_branching_factor ();
   test_sorted_order_and_uniqueness ();
   test_custom_comparator_and_override_compare ();
   test_equal_comparator_slice_ranges ();

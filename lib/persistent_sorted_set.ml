@@ -1,5 +1,9 @@
 type 'a comparator = 'a -> 'a -> int
 
+type settings =
+  { branching_factor : int
+  }
+
 type 'a stored_node =
   | Values of 'a list
   | Leaf of 'a list
@@ -29,6 +33,7 @@ and 'a edited_tree =
 
 type 'a t =
   { cmp : 'a comparator
+  ; set_settings : settings
   ; data : 'a data
   ; root_address : string option
   ; stored_addresses : string list option
@@ -63,8 +68,18 @@ let normalize_cmp cmp left right =
 
 let default_cmp left right = normalize_cmp Stdlib.compare left right
 
-let empty_by cmp =
+let default_settings = { branching_factor = 32 }
+
+let validate_settings settings =
+  if settings.branching_factor < 2 then invalid_arg "branching_factor must be at least 2";
+  settings
+
+let settings set = set.set_settings
+
+let empty_by ?(settings = default_settings) cmp =
+  let settings = validate_settings settings in
   { cmp = normalize_cmp cmp
+  ; set_settings = settings
   ; data = Loaded []
   ; root_address = None
   ; stored_addresses = None
@@ -73,8 +88,6 @@ let empty_by cmp =
   }
 
 let empty () = empty_by default_cmp
-
-let max_leaf_len = 32
 
 let rec chunks size values =
   match values with
@@ -171,52 +184,52 @@ let edited_branch_key children =
   | Some (key, _) -> key
   | None -> invalid_arg "branch requires at least one child"
 
-let refs_of_branch_chunks children =
+let refs_of_branch_chunks settings children =
   children
-  |> chunks max_leaf_len
+  |> chunks settings.branching_factor
   |> List.map (fun children -> edited_branch_key children, Edited_branch (children, None))
 
-let rec add_to_address storage order_cmp equality_cmp value address =
+let rec add_to_address storage settings order_cmp equality_cmp value address =
   match restore_stored_node storage address with
   | Values values
   | Leaf values ->
     let inserted = insert_unique order_cmp equality_cmp value values in
     if inserted = values then Edit_unchanged
-    else Edit_changed (refs_of_leaf_chunks (chunks max_leaf_len inserted))
+    else Edit_changed (refs_of_leaf_chunks (chunks settings.branching_factor inserted))
   | Branch (keys, child_addresses) ->
     let children = branch_child_refs keys child_addresses in
     let rec loop prefix = function
       | [] -> Edit_unchanged
       | (key, Edited_ref (_, child_address)) :: rest
         when order_cmp value key <= 0 || rest = [] ->
-        (match add_to_address storage order_cmp equality_cmp value child_address with
+        (match add_to_address storage settings order_cmp equality_cmp value child_address with
          | Edit_unchanged -> Edit_unchanged
          | Edit_changed changed ->
            List.rev_append prefix (changed @ rest)
-           |> refs_of_branch_chunks
+           |> refs_of_branch_chunks settings
            |> fun children -> Edit_changed children)
       | child :: rest -> loop (child :: prefix) rest
     in
     loop [] children
 
-let rec remove_from_address storage order_cmp equality_cmp value address =
+let rec remove_from_address storage settings order_cmp equality_cmp value address =
   match restore_stored_node storage address with
   | Values values
   | Leaf values ->
     let removed = remove_by order_cmp equality_cmp value values in
     if removed = values then Edit_unchanged
-    else Edit_changed (refs_of_leaf_chunks (chunks max_leaf_len removed))
+    else Edit_changed (refs_of_leaf_chunks (chunks settings.branching_factor removed))
   | Branch (keys, child_addresses) ->
     let children = branch_child_refs keys child_addresses in
     let rec loop prefix = function
       | [] -> Edit_unchanged
       | (key, Edited_ref (_, child_address)) :: rest
         when order_cmp value key <= 0 || rest = [] ->
-        (match remove_from_address storage order_cmp equality_cmp value child_address with
+        (match remove_from_address storage settings order_cmp equality_cmp value child_address with
          | Edit_unchanged -> Edit_unchanged
          | Edit_changed changed ->
            List.rev_append prefix (changed @ rest)
-           |> refs_of_branch_chunks
+           |> refs_of_branch_chunks settings
            |> fun children -> Edit_changed children)
       | child :: rest -> loop (child :: prefix) rest
     in
@@ -227,7 +240,7 @@ let edited_data_of_changed_refs storage = function
   | [ _, tree ] -> Edited { storage; tree }
   | children -> Edited { storage; tree = Edited_branch (children, None) }
 
-let add_to_stored_chunks order_cmp equality_cmp value stored_chunks =
+let add_to_stored_chunks settings order_cmp equality_cmp value stored_chunks =
   let rec loop acc = function
     | [] -> List.rev acc
     | (chunk, address) :: rest ->
@@ -240,7 +253,7 @@ let add_to_stored_chunks order_cmp equality_cmp value stored_chunks =
         let inserted = insert_unique order_cmp equality_cmp value chunk in
         let changed_chunks =
           inserted
-          |> chunks max_leaf_len
+          |> chunks settings.branching_factor
           |> List.map (fun chunk -> chunk, None)
         in
         List.rev_append acc (changed_chunks @ rest)
@@ -256,7 +269,7 @@ let add ?cmp value set =
   in
   match set.data with
   | Deferred { storage; address } ->
-    (match add_to_address storage set.cmp equality_cmp value address with
+    (match add_to_address storage set.set_settings set.cmp equality_cmp value address with
      | Edit_unchanged -> set
      | Edit_changed changed ->
        { set with
@@ -271,7 +284,7 @@ let add ?cmp value set =
     let values = insert_unique set.cmp equality_cmp value previous_values in
     let stored_chunks =
       if values = previous_values then set.stored_chunks
-      else add_to_stored_chunks set.cmp equality_cmp value set.stored_chunks
+      else add_to_stored_chunks set.set_settings set.cmp equality_cmp value set.stored_chunks
     in
     { set with
       data = Loaded values
@@ -280,8 +293,8 @@ let add ?cmp value set =
     ; stored_chunks
     }
 
-let of_list_by cmp values =
-  List.fold_left (fun set value -> add value set) (empty_by cmp) values
+let of_list_by ?settings cmp values =
+  List.fold_left (fun set value -> add value set) (empty_by ?settings cmp) values
 
 let of_list values = of_list_by default_cmp values
 
@@ -309,7 +322,7 @@ let remove ?cmp value set =
   in
   match set.data with
   | Deferred { storage; address } ->
-    (match remove_from_address storage set.cmp equality_cmp value address with
+    (match remove_from_address storage set.set_settings set.cmp equality_cmp value address with
      | Edit_unchanged -> set
      | Edit_changed changed ->
        { set with
@@ -593,12 +606,12 @@ let store_branch storage reusable_branch_chunks child_refs =
     let keys, child_addresses = split_branch_refs child_refs in
     storage.store_node (Branch (keys, child_addresses))
 
-let rec store_branch_tree storage reusable_branch_chunks child_refs =
-  if List.length child_refs <= max_leaf_len then
+let rec store_branch_tree storage settings reusable_branch_chunks child_refs =
+  if List.length child_refs <= settings.branching_factor then
     let address = store_branch storage reusable_branch_chunks child_refs in
     address, [ address ], [ child_refs, Some address ]
   else
-    let child_groups = chunks max_leaf_len child_refs in
+    let child_groups = chunks settings.branching_factor child_refs in
     let branch_addresses =
       child_groups
       |> List.map (fun child_group ->
@@ -606,7 +619,7 @@ let rec store_branch_tree storage reusable_branch_chunks child_refs =
         branch_key child_group, address)
     in
     let root_address, branch_tree_addresses, branch_chunks =
-      store_branch_tree storage reusable_branch_chunks branch_addresses
+      store_branch_tree storage settings reusable_branch_chunks branch_addresses
     in
     ( root_address
     , branch_tree_addresses @ List.map snd branch_addresses
@@ -616,7 +629,7 @@ let rec store_branch_tree storage reusable_branch_chunks child_refs =
           child_groups
           branch_addresses )
 
-let rec store_edited_tree storage = function
+let rec store_edited_tree storage settings = function
   | Edited_ref (_, address) -> address, [ address ]
   | Edited_leaf (_, Some address) -> address, [ address ]
   | Edited_leaf (values, None) ->
@@ -627,11 +640,11 @@ let rec store_edited_tree storage = function
     let stored_children =
       children
       |> List.map (fun (key, child) ->
-        let address, addresses = store_edited_tree storage child in
+        let address, addresses = store_edited_tree storage settings child in
         (key, address), addresses)
     in
     let child_refs, child_address_lists = List.split stored_children in
-    let address, branch_addresses, _ = store_branch_tree storage [] child_refs in
+    let address, branch_addresses, _ = store_branch_tree storage settings [] child_refs in
     address, branch_addresses @ List.concat child_address_lists
 
 let store storage set =
@@ -640,7 +653,7 @@ let store storage set =
   | None ->
     (match set.data with
      | Edited { storage = source_storage; tree } when source_storage == storage ->
-       let address, addresses = store_edited_tree storage tree in
+       let address, addresses = store_edited_tree storage set.set_settings tree in
        address,
        { set with
          root_address = Some address
@@ -653,7 +666,7 @@ let store storage set =
        let preferred_chunks = List.map fst set.stored_chunks in
        let leaf_chunks =
          if preferred_chunks <> [] && List.concat preferred_chunks = values then preferred_chunks
-         else chunks max_leaf_len values
+         else chunks set.set_settings.branching_factor values
        in
        let store_chunk chunk =
          match List.assoc_opt chunk set.stored_chunks with
@@ -683,7 +696,7 @@ let store storage set =
               child_addresses
           in
           let address, branch_addresses, stored_branch_chunks =
-            store_branch_tree storage set.stored_branch_chunks child_refs
+            store_branch_tree storage set.set_settings set.stored_branch_chunks child_refs
           in
           address,
           { set with
@@ -693,9 +706,11 @@ let store storage set =
           ; stored_branch_chunks
           }))
 
-let restore ~cmp storage address =
+let restore ~cmp ?(settings = default_settings) storage address =
+  let settings = validate_settings settings in
   Some
     { cmp = normalize_cmp cmp
+    ; set_settings = settings
     ; data = Deferred { storage; address }
     ; root_address = Some address
     ; stored_addresses = Some [ address ]

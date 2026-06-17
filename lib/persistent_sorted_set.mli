@@ -1,5 +1,9 @@
 type 'a comparator = 'a -> 'a -> int
 
+type settings =
+  { branching_factor : int
+  }
+
 type 'a stored_node =
   | Values of 'a list
   | Leaf of 'a list
@@ -14,10 +18,12 @@ type 'a storage =
 type 'a t
 type 'a seq
 
+val default_settings : settings
+val settings : 'a t -> settings
 val empty : unit -> 'a t
-val empty_by : 'a comparator -> 'a t
+val empty_by : ?settings:settings -> 'a comparator -> 'a t
 val of_list : 'a list -> 'a t
-val of_list_by : 'a comparator -> 'a list -> 'a t
+val of_list_by : ?settings:settings -> 'a comparator -> 'a list -> 'a t
 val add : ?cmp:'a comparator -> 'a -> 'a t -> 'a t
 val remove : ?cmp:'a comparator -> 'a -> 'a t -> 'a t
 val mem : ?cmp:'a comparator -> 'a -> 'a t -> bool
@@ -36,5 +42,5 @@ val slice_seq : ?from_:'a -> ?to_:'a -> ?cmp:'a comparator -> 'a t -> 'a seq
 val rslice_seq : ?from_:'a -> ?to_:'a -> ?cmp:'a comparator -> 'a t -> 'a seq
 val seek : ?cmp:'a comparator -> 'a -> 'a seq -> 'a seq
 val store : 'a storage -> 'a t -> string * 'a t
-val restore : cmp:'a comparator -> 'a storage -> string -> 'a t option
+val restore : cmp:'a comparator -> ?settings:settings -> 'a storage -> string -> 'a t option
 val walk_addresses : 'a t -> string list
