@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  UPSTREAM_PSS_REPO: https://github.com/logseq/persistent-sorted-set.git
+  UPSTREAM_PSS_COMMIT: d1c8ac4feb061bc8af12654b1199f63b72d6e41c
+
+jobs:
+  test:
+    name: OCaml ${{ matrix.ocaml-compiler }}
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        ocaml-compiler: ["5.2.1"]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up OCaml
+        uses: ocaml/setup-ocaml@v3
+        with:
+          ocaml-compiler: ${{ matrix.ocaml-compiler }}
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install OCaml dependencies
+        run: opam install . --deps-only --with-test -y
+
+      - name: Checkout upstream persistent-sorted-set
+        run: |
+          git clone "$UPSTREAM_PSS_REPO" _ci/persistent-sorted-set
+          git -C _ci/persistent-sorted-set checkout "$UPSTREAM_PSS_COMMIT"
+          test "$(git -C _ci/persistent-sorted-set rev-parse HEAD)" = "$UPSTREAM_PSS_COMMIT"
+
+      - name: Check upstream test coverage
+        env:
+          UPSTREAM_TEST_DIR: ${{ github.workspace }}/_ci/persistent-sorted-set/test-clojure/me/tonsky/persistent_sorted_set/test
+          UPSTREAM_TEST_DIFF_STRICT: "1"
+        run: bash script/diff_upstream_tests.sh
+
+      - name: Run tests
+        run: opam exec -- dune runtest
