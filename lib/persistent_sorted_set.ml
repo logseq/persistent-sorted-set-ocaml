@@ -17,7 +17,7 @@ type 'a storage =
 
 type 'a data =
   | Loaded of 'a list
-  | Tree of 'a edited_tree
+  | Tree of 'a tree
   | Deferred of
       { storage : 'a storage
       ; address : string
@@ -31,6 +31,10 @@ and 'a edited_tree =
   | Edited_ref of 'a * string
   | Edited_leaf of 'a list * string option
   | Edited_branch of ('a * 'a edited_tree) list * string option
+
+and 'a tree =
+  | Tree_leaf of 'a array
+  | Tree_branch of 'a array * 'a tree array
 
 type 'a t =
   { cmp : 'a comparator
@@ -77,9 +81,8 @@ let validate_settings settings =
 
 let settings set = set.set_settings
 
-let empty_by ?(settings = default_settings) cmp =
-  let settings = validate_settings settings in
-  { cmp = normalize_cmp cmp
+let empty_with_cmp settings cmp =
+  { cmp
   ; set_settings = settings
   ; data = Loaded []
   ; root_address = None
@@ -88,7 +91,11 @@ let empty_by ?(settings = default_settings) cmp =
   ; stored_branch_chunks = []
   }
 
-let empty () = empty_by default_cmp
+let empty_by ?(settings = default_settings) cmp =
+  let settings = validate_settings settings in
+  empty_with_cmp settings (normalize_cmp cmp)
+
+let empty () = empty_with_cmp (validate_settings default_settings) default_cmp
 
 let chunks size values =
   let rec loop acc = function
@@ -122,11 +129,18 @@ let rec materialize_edited_tree storage = function
   | Edited_branch (children, _) ->
     children |> List.concat_map (fun (_, child) -> materialize_edited_tree storage child)
 
-let rec materialize_tree = function
-  | Edited_ref _ -> invalid_arg "in-memory tree cannot contain stored refs"
-  | Edited_leaf (values, _) -> values
-  | Edited_branch (children, _) ->
-    children |> List.concat_map (fun (_, child) -> materialize_tree child)
+let array_fold_right f values init =
+  let acc = ref init in
+  for i = Array.length values - 1 downto 0 do
+    acc := f values.(i) !acc
+  done;
+  !acc
+
+let rec materialize_tree tree =
+  match tree with
+  | Tree_leaf values -> array_fold_right (fun value acc -> value :: acc) values []
+  | Tree_branch (_, children) ->
+    array_fold_right (fun child acc -> materialize_tree child @ acc) children []
 
 let materialize set =
   match set.data with
@@ -204,16 +218,32 @@ let refs_of_branch_chunks settings children =
   |> chunks settings.branching_factor
   |> List.map (fun children -> edited_branch_key children, Edited_branch (children, None))
 
+let tree_ref_key refs =
+  match last refs with
+  | Some (key, _) -> key
+  | None -> invalid_arg "tree branch requires at least one child"
+
+let tree_branch_of_refs refs =
+  let keys, children = List.split refs in
+  Tree_branch (Array.of_list keys, Array.of_list children)
+
+let tree_leaf_refs_of_chunks chunks =
+  chunks
+  |> List.map (fun chunk ->
+    let values = Array.of_list chunk in
+    values.(Array.length values - 1), Tree_leaf values)
+
 let rec tree_of_refs settings = function
   | [] -> None
   | [ _, tree ] -> Some tree
   | refs ->
     refs
-    |> refs_of_branch_chunks settings
+    |> chunks settings.branching_factor
+    |> List.map (fun refs -> tree_ref_key refs, tree_branch_of_refs refs)
     |> tree_of_refs settings
 
 let data_of_sorted_values settings values =
-  match values |> chunks settings.branching_factor |> refs_of_leaf_chunks |> tree_of_refs settings with
+  match values |> chunks settings.branching_factor |> tree_leaf_refs_of_chunks |> tree_of_refs settings with
   | None -> Loaded []
   | Some tree -> Tree tree
 
@@ -308,11 +338,197 @@ let edited_data_of_changed_refs storage = function
   | [ _, tree ] -> Edited { storage; tree }
   | children -> Edited { storage; tree = Edited_branch (children, None) }
 
-let in_memory_storage () =
-  { store_node = (fun _ -> invalid_arg "in-memory tree cannot store refs")
-  ; restore_node = (fun _ -> invalid_arg "in-memory tree cannot restore refs")
-  ; accessed = (fun _ -> invalid_arg "in-memory tree cannot access refs")
-  }
+type 'a tree_edit_result =
+  | Tree_edit_unchanged
+  | Tree_edit_changed of ('a * 'a tree) list
+
+let array_insert values index value =
+  let length = Array.length values in
+  let result = Array.make (length + 1) value in
+  Array.blit values 0 result 0 index;
+  result.(index) <- value;
+  Array.blit values index result (index + 1) (length - index);
+  result
+
+let array_remove values index =
+  let length = Array.length values in
+  if length = 1 then [||]
+  else (
+    let first = if index = 0 then values.(1) else values.(0) in
+    let result = Array.make (length - 1) first in
+    Array.blit values 0 result 0 index;
+    Array.blit values (index + 1) result index (length - index - 1);
+    result)
+
+let array_split values =
+  let length = Array.length values in
+  let left_length = length / 2 in
+  [ Array.sub values 0 left_length; Array.sub values left_length (length - left_length) ]
+
+let tree_leaf_refs_of_arrays arrays =
+  arrays |> List.map (fun values -> values.(Array.length values - 1), Tree_leaf values)
+
+let tree_branch_refs_of_arrays settings keys children =
+  let length = Array.length keys in
+  if length = 0 then []
+  else if length <= settings.branching_factor then [ keys.(length - 1), Tree_branch (keys, children) ]
+  else
+    let key_chunks = array_split keys in
+    let child_chunks = array_split children in
+    List.map2
+      (fun keys children -> keys.(Array.length keys - 1), Tree_branch (keys, children))
+      key_chunks
+      child_chunks
+
+let ref_arrays_of_list refs =
+  let keys, children = List.split refs in
+  Array.of_list keys, Array.of_list children
+
+let branch_splice_one keys children index replacement =
+  let length = Array.length keys in
+  let replacement_keys, replacement_children = ref_arrays_of_list replacement in
+  let replacement_length = Array.length replacement_keys in
+  let result_length = length - 1 + replacement_length in
+  if result_length = 0 then [||], [||]
+  else (
+    let first =
+      if index > 0 then keys.(0)
+      else if replacement_length > 0 then replacement_keys.(0)
+      else keys.(1)
+    in
+    let first_child =
+      if index > 0 then children.(0)
+      else if replacement_length > 0 then replacement_children.(0)
+      else children.(1)
+    in
+    let result_keys = Array.make result_length first in
+    let result_children = Array.make result_length first_child in
+    Array.blit keys 0 result_keys 0 index;
+    Array.blit children 0 result_children 0 index;
+    Array.blit replacement_keys 0 result_keys index replacement_length;
+    Array.blit replacement_children 0 result_children index replacement_length;
+    Array.blit keys (index + 1) result_keys (index + replacement_length) (length - index - 1);
+    Array.blit children (index + 1) result_children (index + replacement_length) (length - index - 1);
+    result_keys, result_children)
+
+let branch_replace_one settings keys children index key child =
+  let keys = Array.copy keys in
+  let children = Array.copy children in
+  keys.(index) <- key;
+  children.(index) <- child;
+  tree_branch_refs_of_arrays settings keys children
+
+let total_cmp order_cmp equality_cmp left right =
+  match order_cmp left right with
+  | 0 -> equality_cmp left right
+  | n -> n
+
+let find_insert_index order_cmp equality_cmp value values =
+  let length = Array.length values in
+  let low = ref 0 in
+  let high = ref (length - 1) in
+  while !low <= !high do
+    let middle = (!low + !high) / 2 in
+    if total_cmp order_cmp equality_cmp values.(middle) value < 0 then low := middle + 1
+    else high := middle - 1
+  done;
+  let index = !low in
+  if index < length && total_cmp order_cmp equality_cmp values.(index) value = 0 then `Found index
+  else `Insert index
+
+let find_remove_index order_cmp equality_cmp value values =
+  let length = Array.length values in
+  let low = ref 0 in
+  let high = ref (length - 1) in
+  while !low <= !high do
+    let middle = (!low + !high) / 2 in
+    if total_cmp order_cmp equality_cmp values.(middle) value < 0 then low := middle + 1
+    else high := middle - 1
+  done;
+  let index = !low in
+  if index < length && total_cmp order_cmp equality_cmp values.(index) value = 0 then Some index else None
+
+let find_index_by_cmp cmp value values =
+  let length = Array.length values in
+  let low = ref 0 in
+  let high = ref (length - 1) in
+  while !low <= !high do
+    let middle = (!low + !high) / 2 in
+    if cmp values.(middle) value < 0 then low := middle + 1
+    else high := middle - 1
+  done;
+  let index = !low in
+  if index < length && cmp values.(index) value = 0 then Some index else None
+
+let array_mem_by order_cmp equality_cmp value values =
+  match find_remove_index order_cmp equality_cmp value values with
+  | Some _ -> true
+  | None -> false
+
+let array_mem_by_cmp cmp value values =
+  match find_index_by_cmp cmp value values with
+  | Some _ -> true
+  | None -> false
+
+let find_child_index key_cmp value keys =
+  let length = Array.length keys in
+  if length = 0 then invalid_arg "tree branch cannot be empty";
+  let low = ref 0 in
+  let high = ref (length - 1) in
+  let best = ref (-1) in
+  while !low <= !high do
+    let middle = (!low + !high) / 2 in
+    let key = keys.(middle) in
+    if key_cmp value key <= 0 then (
+      best := middle;
+      high := middle - 1)
+    else low := middle + 1
+  done;
+  if !best < 0 then length - 1 else !best
+
+let rec add_to_tree settings order_cmp equality_cmp key_cmp value = function
+  | Tree_leaf values ->
+    (match find_insert_index order_cmp equality_cmp value values with
+     | `Found _ -> Tree_edit_unchanged
+     | `Insert index ->
+       let inserted = array_insert values index value in
+       let changed =
+         if Array.length inserted <= settings.branching_factor then [ inserted ]
+         else array_split inserted
+       in
+       Tree_edit_changed (tree_leaf_refs_of_arrays changed))
+  | Tree_branch (keys, children) ->
+    let index = find_child_index key_cmp value keys in
+    (match add_to_tree settings order_cmp equality_cmp key_cmp value children.(index) with
+     | Tree_edit_unchanged -> Tree_edit_unchanged
+     | Tree_edit_changed [ key, child ] ->
+       branch_replace_one settings keys children index key child
+       |> fun changed -> Tree_edit_changed changed
+     | Tree_edit_changed changed ->
+       let keys, children = branch_splice_one keys children index changed in
+       tree_branch_refs_of_arrays settings keys children
+       |> fun changed -> Tree_edit_changed changed)
+
+let rec remove_from_tree settings order_cmp equality_cmp key_cmp value = function
+  | Tree_leaf values ->
+    (match find_remove_index order_cmp equality_cmp value values with
+     | None -> Tree_edit_unchanged
+     | Some index ->
+       array_remove values index
+       |> (function
+         | [||] -> Tree_edit_changed []
+         | values -> Tree_edit_changed [ values.(Array.length values - 1), Tree_leaf values ]))
+  | Tree_branch (keys, children) ->
+    let index = find_child_index key_cmp value keys in
+    (match remove_from_tree settings order_cmp equality_cmp key_cmp value children.(index) with
+     | Tree_edit_unchanged -> Tree_edit_unchanged
+     | Tree_edit_changed [ key, child ] ->
+       branch_replace_one settings keys children index key child
+       |> fun changed -> Tree_edit_changed changed
+     | Tree_edit_changed changed ->
+       let keys, children = branch_splice_one keys children index changed in
+       tree_branch_refs_of_arrays settings keys children
+       |> fun changed -> Tree_edit_changed changed)
 
 let add_to_stored_chunks settings order_cmp equality_cmp value stored_chunks =
   let rec loop acc = function
@@ -336,10 +552,12 @@ let add_to_stored_chunks settings order_cmp equality_cmp value stored_chunks =
   loop [] stored_chunks
 
 let add ?cmp value set =
-  let equality_cmp =
+  let equality_cmp, key_cmp =
     match cmp with
-    | Some cmp -> normalize_cmp cmp
-    | None -> set.cmp
+    | Some cmp ->
+      let equality_cmp = normalize_cmp cmp in
+      equality_cmp, (fun value key -> route_cmp set.cmp equality_cmp value key)
+    | None -> set.cmp, set.cmp
   in
   match set.data with
   | Deferred { storage; address } ->
@@ -368,9 +586,9 @@ let add ?cmp value set =
       ; stored_chunks
       })
     else
-      (match add_to_edited_tree (in_memory_storage ()) set.set_settings set.cmp equality_cmp value tree with
-       | Edit_unchanged -> set
-       | Edit_changed changed ->
+      (match add_to_tree set.set_settings set.cmp equality_cmp key_cmp value tree with
+       | Tree_edit_unchanged -> set
+       | Tree_edit_changed changed ->
          { set with
            data =
              (match tree_of_refs set.set_settings changed with
@@ -385,8 +603,8 @@ let add ?cmp value set =
     (match add_to_edited_tree storage set.set_settings set.cmp equality_cmp value tree with
      | Edit_unchanged -> set
      | Edit_changed changed ->
-       { set with
-         data = edited_data_of_changed_refs storage changed
+      { set with
+        data = edited_data_of_changed_refs storage changed
        ; root_address = None
        ; stored_addresses = None
        ; stored_chunks = []
@@ -430,7 +648,14 @@ let of_sorted_array_by ?settings cmp values =
   let values = distinct_sorted_values set.cmp !values_list in
   { set with data = data_of_sorted_values set.set_settings values }
 
-let of_sorted_array values = of_sorted_array_by default_cmp values
+let of_sorted_array values =
+  let set = empty () in
+  let values_list = ref [] in
+  for i = Array.length values - 1 downto 0 do
+    values_list := values.(i) :: !values_list
+  done;
+  let values = distinct_sorted_values set.cmp !values_list in
+  { set with data = data_of_sorted_values set.set_settings values }
 
 let remove_from_stored_chunks order_cmp equality_cmp value stored_chunks =
   let rec loop acc = function
@@ -449,10 +674,12 @@ let remove_from_stored_chunks order_cmp equality_cmp value stored_chunks =
   loop [] stored_chunks
 
 let remove ?cmp value set =
-  let equality_cmp =
+  let equality_cmp, key_cmp =
     match cmp with
-    | Some cmp -> normalize_cmp cmp
-    | None -> set.cmp
+    | Some cmp ->
+      let equality_cmp = normalize_cmp cmp in
+      equality_cmp, (fun value key -> route_cmp set.cmp equality_cmp value key)
+    | None -> set.cmp, set.cmp
   in
   match set.data with
   | Deferred { storage; address } ->
@@ -481,9 +708,9 @@ let remove ?cmp value set =
       ; stored_chunks
       })
     else
-      (match remove_from_edited_tree (in_memory_storage ()) set.set_settings set.cmp equality_cmp value tree with
-       | Edit_unchanged -> set
-       | Edit_changed changed ->
+      (match remove_from_tree set.set_settings set.cmp equality_cmp key_cmp value tree with
+       | Tree_edit_unchanged -> set
+       | Tree_edit_changed changed ->
          { set with
            data =
              (match tree_of_refs set.set_settings changed with
@@ -583,17 +810,48 @@ let mem_in_edited_tree storage order_cmp equality_cmp value tree =
   | Found -> true
   | Stop | Continue -> false
 
+let rec search_tree order_cmp equality_cmp key_cmp value = function
+  | Tree_leaf values ->
+    if array_mem_by order_cmp equality_cmp value values then Found
+    else if Array.length values > 0 && order_cmp value values.(Array.length values - 1) <= 0 then Stop
+    else Continue
+  | Tree_branch (keys, children) ->
+    let index = find_child_index key_cmp value keys in
+    search_tree order_cmp equality_cmp key_cmp value children.(index)
+
+let mem_in_tree order_cmp equality_cmp key_cmp value tree =
+  match search_tree order_cmp equality_cmp key_cmp value tree with
+  | Found -> true
+  | Stop | Continue -> false
+
+let rec search_tree_by_cmp cmp value = function
+  | Tree_leaf values ->
+    if array_mem_by_cmp cmp value values then Found
+    else if Array.length values > 0 && cmp value values.(Array.length values - 1) <= 0 then Stop
+    else Continue
+  | Tree_branch (keys, children) ->
+    let index = find_child_index cmp value keys in
+    search_tree_by_cmp cmp value children.(index)
+
+let mem_in_tree_by_cmp cmp value tree =
+  match search_tree_by_cmp cmp value tree with
+  | Found -> true
+  | Stop | Continue -> false
+
 let mem ?cmp value set =
-  let equality_cmp =
-    match cmp with
-    | Some cmp -> normalize_cmp cmp
-    | None -> set.cmp
-  in
-  match set.data with
-  | Loaded values -> mem_by set.cmp equality_cmp value values
-  | Tree tree -> mem_in_edited_tree (in_memory_storage ()) set.cmp equality_cmp value tree
-  | Deferred { storage; address } -> mem_in_deferred storage set.cmp equality_cmp value address
-  | Edited { storage; tree } -> mem_in_edited_tree storage set.cmp equality_cmp value tree
+  match cmp, set.data with
+  | None, Loaded values -> mem_by set.cmp set.cmp value values
+  | None, Tree tree -> mem_in_tree_by_cmp set.cmp value tree
+  | None, Deferred { storage; address } -> mem_in_deferred storage set.cmp set.cmp value address
+  | None, Edited { storage; tree } -> mem_in_edited_tree storage set.cmp set.cmp value tree
+  | Some cmp, data ->
+    let equality_cmp = normalize_cmp cmp in
+    let key_cmp value key = route_cmp set.cmp equality_cmp value key in
+    (match data with
+     | Loaded values -> mem_by set.cmp equality_cmp value values
+     | Tree tree -> mem_in_tree set.cmp equality_cmp key_cmp value tree
+     | Deferred { storage; address } -> mem_in_deferred storage set.cmp equality_cmp value address
+     | Edited { storage; tree } -> mem_in_edited_tree storage set.cmp equality_cmp value tree)
 
 let rec fold_edited_tree storage f init = function
   | Edited_ref (_, address) -> List.fold_left f init (materialize_address storage address)
@@ -605,10 +863,9 @@ let rec fold_edited_tree storage f init = function
       children
 
 let rec fold_tree f init = function
-  | Edited_ref _ -> invalid_arg "in-memory tree cannot contain stored refs"
-  | Edited_leaf (values, _) -> List.fold_left f init values
-  | Edited_branch (children, _) ->
-    List.fold_left (fun acc (_, child) -> fold_tree f acc child) init children
+  | Tree_leaf values -> Array.fold_left f init values
+  | Tree_branch (_, children) ->
+    Array.fold_left (fun acc child -> fold_tree f acc child) init children
 
 let count (set : 'a t) =
   match set.data with

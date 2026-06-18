@@ -23,13 +23,20 @@ cd "$repo_root"
 dune build --profile release bench/bench_pss.exe bench/bench_pss.bc.js
 
 printf "\n== ocaml-native ==\n"
-"$repo_root/_build/default/bench/bench_pss.exe" "${benches[@]}"
+for bench in "${benches[@]}"; do
+  "$repo_root/_build/default/bench/bench_pss.exe" "$bench" | tail -n +2
+done
 
 printf "\n== js_of_ocaml ==\n"
-node "$repo_root/_build/default/bench/bench_pss.bc.js" "${benches[@]}"
+for bench in "${benches[@]}"; do
+  node "$repo_root/_build/default/bench/bench_pss.bc.js" "$bench" | tail -n +2
+done
 
 printf "\n== upstream-cljs-js ==\n"
 (
   cd "$upstream_pss_dir"
-  script/bench_cljs.sh "${benches[@]}"
+  yarn shadow-cljs release bench
+  for bench in "${benches[@]}"; do
+    node target/bench.js "$bench" | tail -n +2
+  done
 )

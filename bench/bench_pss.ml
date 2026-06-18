@@ -52,7 +52,7 @@ let format_ms value =
   else if value > 0.01 then Printf.sprintf "%.3f" value
   else Printf.sprintf "%.7f" value
 
-let shuffled_range size =
+let shuffled_array size =
   let values = Array.init size Fun.id in
   let seed = ref 0x5eed in
   for i = size - 1 downto 1 do
@@ -62,9 +62,10 @@ let shuffled_range size =
     values.(i) <- values.(j);
     values.(j) <- value
   done;
-  Array.to_list values
+  values
 
-let ints_10k = shuffled_range 10_000
+let ints_10k = shuffled_array 10_000
+
 let set_10k = lazy (of_sorted_array (Array.init 10_000 Fun.id))
 let set_300k = lazy (of_sorted_array (Array.init 300_000 Fun.id))
 
@@ -92,15 +93,26 @@ let restored_10k = lazy (
   root, storage)
 
 let bench_conj_10k () =
-  ints_10k |> List.fold_left (fun set value -> add value set) (empty ()) |> count |> consume_int
+  let set = ref (empty ()) in
+  for i = 0 to Array.length ints_10k - 1 do
+    set := add ints_10k.(i) !set
+  done;
+  consume_int (count !set)
 
 let bench_disj_10k () =
-  ints_10k |> List.fold_left (fun set value -> remove value set) (Lazy.force set_10k) |> count |> consume_int
+  let set = ref (Lazy.force set_10k) in
+  for i = 0 to Array.length ints_10k - 1 do
+    set := remove ints_10k.(i) !set
+  done;
+  consume_int (count !set)
 
 let bench_contains_10k () =
   let set = Lazy.force set_10k in
-  let found = List.fold_left (fun count value -> if mem value set then count + 1 else count) 0 ints_10k in
-  consume_int found
+  let found = ref 0 in
+  for i = 0 to Array.length ints_10k - 1 do
+    if mem ints_10k.(i) set then incr found
+  done;
+  consume_int !found
 
 let bench_doseq_300k () =
   Lazy.force set_300k |> fold (fun () value -> consume_int value) ()

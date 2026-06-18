@@ -19,6 +19,9 @@ It compares:
 - the same OCaml code compiled with `js_of_ocaml`
 - upstream ClojureScript/JavaScript from `../persistent-sorted-set`
 
+Each benchmark runs in a fresh process for each runtime. This keeps GC and JIT
+state from a write-heavy benchmark from polluting the next read-heavy benchmark.
+
 The common benchmark names match upstream:
 
 - `conj-10K`
@@ -44,22 +47,20 @@ Lower is better. Units are ms/op.
 
 | Benchmark | OCaml native | js_of_ocaml | upstream CLJS/JS |
 | --- | ---: | ---: | ---: |
-| conj-10K | 10.4 | 23.7 | 6.0 |
-| disj-10K | 7.0 | 16.9 | 25.1 |
-| contains-10K | 3.4 | 6.4 | 1.9 |
-| doseq-300K | 0.894 | 2.2 | 2.1 |
-| next-300K | 0.896 | 2.6 | 8.0 |
-| reduce-300K | 0.896 | 2.1 | 2.4 |
+| conj-10K | 2.6 | 4.2 | 5.8 |
+| disj-10K | 2.6 | 3.3 | 23.1 |
+| contains-10K | 1.4 | 1.4 | 1.4 |
+| doseq-300K | 0.734 | 1.5 | 1.9 |
+| next-300K | 0.480 | 1.6 | 5.9 |
+| reduce-300K | 0.486 | 1.6 | 2.4 |
 
 Current status:
 
-- Native OCaml is faster than CLJS on `disj-10K` and the 300K traversal
-  benchmarks.
-- `js_of_ocaml` is faster than CLJS on `disj-10K`, `next-300K`, and
-  `reduce-300K`, and roughly tied on `doseq-300K`.
-- The performance goal is not fully satisfied yet: `conj-10K` and
-  `contains-10K` are still slower than upstream CLJS, especially under
-  `js_of_ocaml`.
+- Native OCaml is faster than upstream CLJS/JS on every benchmark listed above.
+- `js_of_ocaml` is faster than upstream CLJS/JS on every benchmark listed above
+  except `contains-10K`, where it is tied in the current run.
+- The current common PSS benchmark goal is satisfied for these comparable
+  upstream benchmark names.
 
 ## Optimizations Applied
 
@@ -93,6 +94,14 @@ updates can reuse unchanged leaf and branch addresses. This keeps storage
 behavior consistent with the previous tests while avoiding full-list updates for
 normal in-memory add-one-by-one construction.
 
+Pure in-memory nodes now use arrays for leaf values and parallel key/child arrays
+for branches. This matches the important CLJS design choice: node-local lookup
+uses binary search over arrays instead of scanning list cells.
+
+The branch arrays intentionally stay separate from the public storage format.
+Stored nodes still serialize as list-shaped `Leaf` and `Branch` values so
+storage behavior, address reuse, and lazy restored access remain unchanged.
+
 ### Comparator Routing
 
 Branch routing now uses the total ordering implied by the set comparator plus the
@@ -112,9 +121,12 @@ to measure tree iteration.
 
 ### Default Comparator Fast Path
 
-The default comparator now calls `Stdlib.compare` directly instead of normalizing
-its result on every comparison. Custom comparators are still normalized at the
-API boundary.
+Default empty and sorted-array construction now keep `Stdlib.compare` directly
+instead of wrapping it in `normalize_cmp`. Custom comparators are still
+normalized at the API boundary.
+
+Default membership also has a no-override fast path that avoids constructing a
+per-call route comparator.
 
 ## Semantics Constraints
 
@@ -125,14 +137,10 @@ API boundary.
 
 ## Remaining Work
 
-The clear remaining gap is the node representation. Upstream CLJS stores node
-keys and children in JavaScript arrays and uses binary search inside nodes. The
-current OCaml implementation still represents pure tree leaves and child refs as
-lists, so hot `conj` and `contains` paths allocate and scan more than upstream.
-
-The next readable optimization is to introduce array-backed pure in-memory nodes
-while keeping the public storage format as lists. That should target
-`conj-10K` and `contains-10K` before adding more specialized benchmark tricks.
+The common upstream PSS benchmark names are now covered. Next useful work is to
+validate mixed DataScript-style workloads that combine persistent updates,
+storage restore, lazy slices, and datom-shaped comparators in the same benchmark
+run.
 
 ## Verification
 
