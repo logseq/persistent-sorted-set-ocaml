@@ -37,6 +37,43 @@ let shuffled values =
   |> List.sort compare
   |> List.map snd
 
+let random_values seed length bound =
+  let state = Random.State.make [| seed |] in
+  List.init length (fun _ -> Random.State.int state bound)
+
+let sorted_unique values = List.sort_uniq compare values
+
+let remove_values values removals =
+  let removals = sorted_unique removals in
+  List.filter (fun value -> not (List.mem value removals)) values
+
+let take n values =
+  let rec loop acc n = function
+    | _ when n <= 0 -> List.rev acc
+    | [] -> List.rev acc
+    | value :: rest -> loop (value :: acc) (n - 1) rest
+  in
+  loop [] n values
+
+let roundtrip_set set =
+  let memory = Hashtbl.create 64 in
+  let writes = ref 0 in
+  let storage =
+    { store_node =
+        (fun node ->
+          incr writes;
+          let address = "node-" ^ string_of_int !writes in
+          Hashtbl.replace memory address node;
+          address)
+    ; restore_node = (fun address -> Hashtbl.find_opt memory address)
+    ; accessed = (fun _ -> ())
+    }
+  in
+  let root, _ = store storage set in
+  match restore ~cmp:compare storage root with
+  | Some restored -> restored
+  | None -> failwith "roundtrip_set should restore the stored root"
+
 let compare_pair_with_nil_wildcard (x0, x1) (y0, y1) =
   let compare_part left right =
     match left, right with
@@ -498,6 +535,130 @@ let test_fold_reduces_sets_and_sequences () =
   assert_equal_int "fold_list sums reverse slice" 7_502_500 (fold_list sum 0 (rslice ~from_:4000 ~to_:1000 set));
   assert_equal_int "fold_seq sums seek result" 12_471_375 (fold_seq sum 0 (seq set |> seek 250));
   assert_equal_int "fold_seq sums reversed seek result" 12_471_375 (fold_seq sum 0 (seq set |> seek 250 |> seq_reverse))
+
+let test_upstream_stresstest_btset_parity () =
+  for iteration = 0 to 9 do
+    let size = 1200 in
+    let xs = random_values (1000 + iteration) (1 + (iteration * 137 mod size)) size in
+    let xs_sorted = sorted_unique xs in
+    let rm = random_values (2000 + iteration) ((iteration * 311) mod (size * 3)) size in
+    let full_rm = shuffled (xs @ rm) in
+    let expected_after_remove = remove_values xs_sorted rm in
+    let cases =
+      [ "conj", of_list xs
+      ; "bulk", of_list (List.rev xs)
+      ; "lazy", roundtrip_set (of_list xs)
+      ]
+    in
+    List.iter
+      (fun (method_name, set0) ->
+         assert_equal_list
+           ("stresstest-btset " ^ method_name ^ " builds sorted unique values")
+           xs_sorted
+           (to_list set0);
+         assert_equal_int
+           ("stresstest-btset " ^ method_name ^ " count")
+           (List.length xs_sorted)
+           (count set0);
+         let set1 = List.fold_left (fun set value -> remove value set) set0 rm in
+         assert_equal_list
+           ("stresstest-btset " ^ method_name ^ " disj")
+           expected_after_remove
+           (to_list set1);
+         assert_equal_int
+           ("stresstest-btset " ^ method_name ^ " disj count")
+           (List.length expected_after_remove)
+           (count set1);
+         let set2 = List.fold_left (fun set value -> remove value set) set0 full_rm in
+         assert_equal_list ("stresstest-btset " ^ method_name ^ " full disj") [] (to_list set2))
+      cases
+  done
+
+let test_upstream_stresstest_slice_parity () =
+  for iteration = 0 to 11 do
+    let size = 2000 in
+    let xs = random_values (3000 + iteration) (1 + (iteration * 257 mod size)) size in
+    let xs_sorted = sorted_unique xs in
+    let left = 1000 - Random.State.int (Random.State.make [| 4000 + iteration |]) 2000 in
+    let right = 1000 + Random.State.int (Random.State.make [| 5000 + iteration |]) 2000 in
+    let from_ = min left right in
+    let to_ = max left right in
+    let expected = List.filter (fun value -> from_ <= value && value <= to_) xs_sorted in
+    let cases =
+      [ "conj", of_list xs
+      ; "lazy", roundtrip_set (of_list xs)
+      ]
+    in
+    List.iter
+      (fun (method_name, set) ->
+         let set_range = slice ~from_ ~to_ set in
+         assert_equal_list
+           ("stresstest-slice " ^ method_name ^ " slice")
+           expected
+           set_range;
+         assert_equal_list
+           ("stresstest-slice " ^ method_name ^ " slice_seq")
+           expected
+           (slice_seq ~from_ ~to_ set |> seq_to_list);
+         assert_equal_list
+           ("stresstest-slice " ^ method_name ^ " reverse view")
+           (List.rev expected)
+           (rslice ~from_:to_ ~to_:from_ set))
+      cases
+  done
+
+let test_upstream_stresstest_rslice_parity () =
+  for iteration = 0 to 19 do
+    let len = 3000 in
+    let xs = shuffled (irange 0 len) in
+    let set = of_list xs in
+    let from_ = len + 100 - (iteration mod 3) in
+    let to_ = -100 + (iteration mod 5) in
+    let expected = irange len 0 in
+    assert_equal_list "stresstest-rslice returns descending full range" expected (rslice ~from_ ~to_ set);
+    assert_equal_list
+      "stresstest-rslice sequence reverse round-trips"
+      expected
+      (rslice_seq ~from_ ~to_ set |> seq_reverse |> seq_to_list |> List.rev)
+  done
+
+let test_upstream_stresstest_seek_parity () =
+  for iteration = 0 to 15 do
+    let size = 2000 in
+    let xs = random_values (6000 + iteration) (1 + Random.State.int (Random.State.make [| 7000 + iteration |]) size) size in
+    let xs_sorted = sorted_unique xs in
+    let seek_to = Random.State.int (Random.State.make [| 8000 + iteration |]) size in
+    let set = of_list xs_sorted in
+    let expected_asc = List.filter (fun value -> value >= seek_to) xs_sorted in
+    let expected_desc =
+      xs_sorted
+      |> List.filter (fun value -> value <= seek_to)
+      |> List.rev
+    in
+    assert_equal_list "stresstest-seek asc" expected_asc (seq set |> seek seek_to |> seq_to_list);
+    assert_equal_list "stresstest-seek asc near upper edge" (List.filter (fun value -> value >= (size - 1)) xs_sorted) (seq set |> seek (size - 1) |> seq_to_list);
+    assert_equal_list "stresstest-seek desc" expected_desc (rseq set |> seek seek_to |> seq_to_list);
+    assert_equal_list "stresstest-seek desc near lower edge" (List.filter (fun value -> value <= 1) xs_sorted |> List.rev) (rseq set |> seek 1 |> seq_to_list)
+  done
+
+let test_upstream_overflow_batched_insert_smoke () =
+  let len = 12_000 in
+  let part = len / 100 in
+  let values = shuffled (irange 0 (len - 1)) in
+  let rec partition acc current count = function
+    | [] -> List.rev (if current = [] then acc else List.rev current :: acc)
+    | value :: rest when count = part -> partition (List.rev current :: acc) [ value ] 1 rest
+    | value :: rest -> partition acc (value :: current) (count + 1) rest
+  in
+  let batches = partition [] [] 0 values in
+  let set =
+    List.fold_left
+      (fun set batch -> List.fold_left (fun set value -> add value set) set batch)
+      (empty ())
+      batches
+  in
+  assert_equal_int "overflow batched insert count" len (count set);
+  assert_equal_list "overflow batched insert can read first values" (irange 0 9) (take 10 (to_list set))
 
 let test_storage_round_trip_and_stable_addresses () =
   let memory = Hashtbl.create 8 in
@@ -1255,6 +1416,11 @@ let () =
   test_seek ();
   test_slice_sequences_are_seekable_and_reversible ();
   test_fold_reduces_sets_and_sequences ();
+  test_upstream_stresstest_btset_parity ();
+  test_upstream_stresstest_slice_parity ();
+  test_upstream_stresstest_rslice_parity ();
+  test_upstream_stresstest_seek_parity ();
+  test_upstream_overflow_batched_insert_smoke ();
   test_storage_round_trip_and_stable_addresses ();
   test_storage_uses_leaf_and_branch_nodes_for_large_sets ();
   test_storage_remove_preserves_unchanged_leaf_addresses ();

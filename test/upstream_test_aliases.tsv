@@ -1,0 +1,18 @@
+# Upstream persistent-sorted-set test coverage aliases for script/diff_upstream_tests.sh.
+# Format: upstream_file<TAB>upstream_deftest<TAB>ocaml_test_function
+# Use "-" only for explicit Clojure/JVM-only non-goals.
+core.cljc	semantic-test-btset-by	test_pair_comparator_nil_wildcard_slices
+core.cljc	test-slice	test_upstream_fractional_slice_boundaries
+core.cljc	test-reduces	test_fold_reduces_sets_and_sequences
+core.cljc	iter-over-transient	-
+core.cljc	seek-for-seq-test	test_slice_sequences_are_seekable_and_reversible
+small.cljc	test-small	test_sorted_order_and_uniqueness
+stress.cljc	stresstest-btset	test_upstream_stresstest_btset_parity
+stress.cljc	stresstest-slice	test_upstream_stresstest_slice_parity
+stress.cljc	stresstest-rslice	test_upstream_stresstest_rslice_parity
+stress.cljc	stresstest-seek	test_upstream_stresstest_seek_parity
+stress.cljc	test-overflow	test_upstream_overflow_batched_insert_smoke
+storage.clj	test-lazy-remove	test_nested_storage_remove_reuses_unchanged_branch_addresses
+storage.clj	stresstest-stable-addresses	test_storage_round_trip_and_stable_addresses
+storage.clj	test-walk	test_restored_walk_addresses_visits_stored_descendants
+storage.clj	test-lazyness	test_restored_seq_seek_is_lazy
