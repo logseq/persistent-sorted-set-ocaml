@@ -15,7 +15,7 @@ type 'a storage =
   }
 
 type 'a data =
-  | Loaded of 'a list
+  | Empty
   | Tree of 'a tree
   | Deferred of
       { storage : 'a storage
@@ -83,7 +83,7 @@ let settings set = set.set_settings
 let empty_with_cmp settings cmp =
   { cmp
   ; set_settings = settings
-  ; data = Loaded []
+  ; data = Empty
   ; root_address = None
   ; stored_addresses = None
   ; stored_chunks = []
@@ -142,7 +142,7 @@ let rec materialize_tree tree =
 
 let materialize set =
   match set.data with
-  | Loaded values -> values
+  | Empty -> []
   | Tree tree -> materialize_tree tree
   | Deferred { storage; address } -> materialize_address storage address
   | Edited { storage; tree } -> materialize_edited_tree storage tree
@@ -242,7 +242,7 @@ let rec tree_of_refs settings = function
 
 let data_of_sorted_values settings values =
   match values |> chunks settings.branching_factor |> tree_leaf_refs_of_chunks |> tree_of_refs settings with
-  | None -> Loaded []
+  | None -> Empty
   | Some tree -> Tree tree
 
 let rec add_to_address storage settings order_cmp equality_cmp value address =
@@ -330,7 +330,7 @@ let rec remove_from_edited_tree storage settings order_cmp equality_cmp value = 
     loop [] children
 
 let edited_data_of_changed_refs storage = function
-  | [] -> Loaded []
+  | [] -> Empty
   | [ _, tree ] -> Edited { storage; tree }
   | children -> Edited { storage; tree = Edited_branch (children, None) }
 
@@ -588,7 +588,7 @@ let add ?cmp value set =
          { set with
            data =
              (match tree_of_refs set.set_settings changed with
-              | None -> Loaded []
+              | None -> Empty
               | Some tree -> Tree tree)
          ; root_address = None
          ; stored_addresses = None
@@ -606,7 +606,7 @@ let add ?cmp value set =
        ; stored_chunks = []
        ; stored_branch_chunks = []
        })
-  | Loaded _ ->
+  | Empty ->
     let previous_values = materialize set in
     let values = insert_unique set.cmp equality_cmp value previous_values in
     let stored_chunks =
@@ -710,7 +710,7 @@ let remove ?cmp value set =
          { set with
            data =
              (match tree_of_refs set.set_settings changed with
-              | None -> Loaded []
+              | None -> Empty
               | Some tree -> Tree tree)
          ; root_address = None
          ; stored_addresses = None
@@ -728,19 +728,7 @@ let remove ?cmp value set =
        ; stored_chunks = []
        ; stored_branch_chunks = []
        })
-  | Loaded _ ->
-    let previous_values = materialize set in
-    let values = remove_by set.cmp equality_cmp value previous_values in
-    let stored_chunks =
-      if values = previous_values then set.stored_chunks
-      else remove_from_stored_chunks set.cmp equality_cmp value set.stored_chunks
-    in
-    { set with
-      data = data_of_sorted_values set.set_settings values
-    ; root_address = (if values = previous_values then set.root_address else None)
-    ; stored_addresses = (if values = previous_values then set.stored_addresses else None)
-    ; stored_chunks
-    }
+  | Empty -> set
 
 let rec mem_by order_cmp equality_cmp value = function
   | [] -> false
@@ -835,7 +823,7 @@ let mem_in_tree_by_cmp cmp value tree =
 
 let mem ?cmp value set =
   match cmp, set.data with
-  | None, Loaded values -> mem_by set.cmp set.cmp value values
+  | None, Empty -> false
   | None, Tree tree -> mem_in_tree_by_cmp set.cmp value tree
   | None, Deferred { storage; address } -> mem_in_deferred storage set.cmp set.cmp value address
   | None, Edited { storage; tree } -> mem_in_edited_tree storage set.cmp set.cmp value tree
@@ -843,7 +831,7 @@ let mem ?cmp value set =
     let equality_cmp = normalize_cmp cmp in
     let key_cmp value key = route_cmp set.cmp equality_cmp value key in
     (match data with
-     | Loaded values -> mem_by set.cmp equality_cmp value values
+     | Empty -> false
      | Tree tree -> mem_in_tree set.cmp equality_cmp key_cmp value tree
      | Deferred { storage; address } -> mem_in_deferred storage set.cmp equality_cmp value address
      | Edited { storage; tree } -> mem_in_edited_tree storage set.cmp equality_cmp value tree)
@@ -866,15 +854,17 @@ let count (set : 'a t) =
   match set.data with
   | Tree tree -> fold_tree (fun count _ -> count + 1) 0 tree
   | Edited { storage; tree } -> fold_edited_tree storage (fun count _ -> count + 1) 0 tree
-  | Loaded _ | Deferred _ -> List.length (materialize set)
+  | Empty -> 0
+  | Deferred _ -> List.length (materialize set)
 
 let to_list (set : 'a t) = materialize set
 
 let fold f init set =
   match set.data with
+  | Empty -> init
   | Tree tree -> fold_tree f init tree
   | Edited { storage; tree } -> fold_edited_tree storage f init tree
-  | Loaded _ | Deferred _ -> List.fold_left f init (materialize set)
+  | Deferred _ -> List.fold_left f init (materialize set)
 
 let fold_list f init values = List.fold_left f init values
 
@@ -971,7 +961,7 @@ let rec reverse_slice_deferred storage cmp from_ to_ address =
 let slice ?from_ ?to_ ?cmp (set : 'a t) =
   let cmp = Option.value ~default:set.cmp cmp in
   match set.data with
-  | Loaded values -> slice_values cmp from_ to_ values
+  | Empty -> []
   | Tree tree -> slice_values cmp from_ to_ (materialize_tree tree)
   | Deferred { storage; address } -> slice_deferred storage cmp from_ to_ address
   | Edited _ -> slice_values cmp from_ to_ (materialize set)
@@ -979,14 +969,14 @@ let slice ?from_ ?to_ ?cmp (set : 'a t) =
 let rslice ?from_ ?to_ ?cmp (set : 'a t) =
   let cmp = Option.value ~default:set.cmp cmp in
   match set.data with
-  | Loaded values -> reverse_slice_values cmp from_ to_ values
+  | Empty -> []
   | Tree tree -> reverse_slice_values cmp from_ to_ (materialize_tree tree)
   | Deferred { storage; address } -> reverse_slice_deferred storage cmp from_ to_ address
   | Edited _ -> reverse_slice_values cmp from_ to_ (materialize set)
 
 let seq_source_of_set set =
   match set.data with
-  | Loaded values -> Seq_values values
+  | Empty -> Seq_values []
   | Tree tree -> Seq_values (materialize_tree tree)
   | Deferred { storage; address } -> Seq_deferred { storage; address }
   | Edited _ -> Seq_values (materialize set)
@@ -1134,7 +1124,7 @@ let store storage set =
        ; stored_chunks = []
        ; stored_branch_chunks = []
        }
-     | Loaded _ | Tree _ | Deferred _ | Edited _ ->
+     | Empty | Tree _ | Deferred _ | Edited _ ->
        let values = materialize set in
        let preferred_chunks = List.map fst set.stored_chunks in
        let leaf_chunks =
@@ -1221,7 +1211,7 @@ let walk_addresses set =
   | Some address ->
     (match set.data with
      | Deferred { storage; address } -> walk_storage_addresses storage address
-     | Loaded _ | Tree _ | Edited _ ->
+     | Empty | Tree _ | Edited _ ->
        if set.stored_branch_chunks <> [] then
          walk_branch_chunk_addresses set.stored_branch_chunks address
        else
