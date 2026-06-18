@@ -1,0 +1,4 @@
+(executable
+ (name bench_pss)
+ (modes exe js)
+ (libraries persistent_sorted_set unix))

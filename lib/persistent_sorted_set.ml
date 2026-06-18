@@ -17,6 +17,7 @@ type 'a storage =
 
 type 'a data =
   | Loaded of 'a list
+  | Tree of 'a edited_tree
   | Deferred of
       { storage : 'a storage
       ; address : string
@@ -66,7 +67,7 @@ let normalize_cmp cmp left right =
   | 0 -> 0
   | _ -> 1
 
-let default_cmp left right = normalize_cmp Stdlib.compare left right
+let default_cmp left right = Stdlib.compare left right
 
 let default_settings = { branching_factor = 32 }
 
@@ -89,10 +90,10 @@ let empty_by ?(settings = default_settings) cmp =
 
 let empty () = empty_by default_cmp
 
-let rec chunks size values =
-  match values with
-  | [] -> []
-  | values ->
+let chunks size values =
+  let rec loop acc = function
+    | [] -> List.rev acc
+    | values ->
     let rec take count acc rest =
       if count = 0 then List.rev acc, rest
       else
@@ -101,7 +102,9 @@ let rec chunks size values =
         | value :: rest -> take (count - 1) (value :: acc) rest
     in
     let chunk, rest = take size [] values in
-    chunk :: chunks size rest
+      loop (chunk :: acc) rest
+  in
+  loop [] values
 
 let rec materialize_address storage address =
   storage.accessed address;
@@ -119,9 +122,16 @@ let rec materialize_edited_tree storage = function
   | Edited_branch (children, _) ->
     children |> List.concat_map (fun (_, child) -> materialize_edited_tree storage child)
 
+let rec materialize_tree = function
+  | Edited_ref _ -> invalid_arg "in-memory tree cannot contain stored refs"
+  | Edited_leaf (values, _) -> values
+  | Edited_branch (children, _) ->
+    children |> List.concat_map (fun (_, child) -> materialize_tree child)
+
 let materialize set =
   match set.data with
   | Loaded values -> values
+  | Tree tree -> materialize_tree tree
   | Deferred { storage; address } -> materialize_address storage address
   | Edited { storage; tree } -> materialize_edited_tree storage tree
 
@@ -156,6 +166,11 @@ let last_exn values =
   | Some value -> value
   | None -> invalid_arg "tree node cannot be empty"
 
+let route_cmp order_cmp equality_cmp value key =
+  match order_cmp value key with
+  | 0 -> equality_cmp value key
+  | n -> n
+
 type 'a edit_result =
   | Edit_unchanged
   | Edit_changed of ('a * 'a edited_tree) list
@@ -189,6 +204,19 @@ let refs_of_branch_chunks settings children =
   |> chunks settings.branching_factor
   |> List.map (fun children -> edited_branch_key children, Edited_branch (children, None))
 
+let rec tree_of_refs settings = function
+  | [] -> None
+  | [ _, tree ] -> Some tree
+  | refs ->
+    refs
+    |> refs_of_branch_chunks settings
+    |> tree_of_refs settings
+
+let data_of_sorted_values settings values =
+  match values |> chunks settings.branching_factor |> refs_of_leaf_chunks |> tree_of_refs settings with
+  | None -> Loaded []
+  | Some tree -> Tree tree
+
 let rec add_to_address storage settings order_cmp equality_cmp value address =
   match restore_stored_node storage address with
   | Values values
@@ -201,8 +229,28 @@ let rec add_to_address storage settings order_cmp equality_cmp value address =
     let rec loop prefix = function
       | [] -> Edit_unchanged
       | (key, Edited_ref (_, child_address)) :: rest
-        when order_cmp value key <= 0 || rest = [] ->
+        when route_cmp order_cmp equality_cmp value key <= 0 || rest = [] ->
         (match add_to_address storage settings order_cmp equality_cmp value child_address with
+         | Edit_unchanged -> Edit_unchanged
+         | Edit_changed changed ->
+           List.rev_append prefix (changed @ rest)
+           |> refs_of_branch_chunks settings
+           |> fun children -> Edit_changed children)
+      | child :: rest -> loop (child :: prefix) rest
+    in
+    loop [] children
+
+let rec add_to_edited_tree storage settings order_cmp equality_cmp value = function
+  | Edited_ref (_, address) -> add_to_address storage settings order_cmp equality_cmp value address
+  | Edited_leaf (values, _) ->
+    let inserted = insert_unique order_cmp equality_cmp value values in
+    if inserted = values then Edit_unchanged
+    else Edit_changed (refs_of_leaf_chunks (chunks settings.branching_factor inserted))
+  | Edited_branch (children, _) ->
+    let rec loop prefix = function
+      | [] -> Edit_unchanged
+      | (key, child) :: rest when route_cmp order_cmp equality_cmp value key <= 0 || rest = [] ->
+        (match add_to_edited_tree storage settings order_cmp equality_cmp value child with
          | Edit_unchanged -> Edit_unchanged
          | Edit_changed changed ->
            List.rev_append prefix (changed @ rest)
@@ -224,8 +272,28 @@ let rec remove_from_address storage settings order_cmp equality_cmp value addres
     let rec loop prefix = function
       | [] -> Edit_unchanged
       | (key, Edited_ref (_, child_address)) :: rest
-        when order_cmp value key <= 0 || rest = [] ->
+        when route_cmp order_cmp equality_cmp value key <= 0 || rest = [] ->
         (match remove_from_address storage settings order_cmp equality_cmp value child_address with
+         | Edit_unchanged -> Edit_unchanged
+         | Edit_changed changed ->
+           List.rev_append prefix (changed @ rest)
+           |> refs_of_branch_chunks settings
+           |> fun children -> Edit_changed children)
+      | child :: rest -> loop (child :: prefix) rest
+    in
+    loop [] children
+
+let rec remove_from_edited_tree storage settings order_cmp equality_cmp value = function
+  | Edited_ref (_, address) -> remove_from_address storage settings order_cmp equality_cmp value address
+  | Edited_leaf (values, _) ->
+    let removed = remove_by order_cmp equality_cmp value values in
+    if removed = values then Edit_unchanged
+    else Edit_changed (refs_of_leaf_chunks (chunks settings.branching_factor removed))
+  | Edited_branch (children, _) ->
+    let rec loop prefix = function
+      | [] -> Edit_unchanged
+      | (key, child) :: rest when route_cmp order_cmp equality_cmp value key <= 0 || rest = [] ->
+        (match remove_from_edited_tree storage settings order_cmp equality_cmp value child with
          | Edit_unchanged -> Edit_unchanged
          | Edit_changed changed ->
            List.rev_append prefix (changed @ rest)
@@ -239,6 +307,12 @@ let edited_data_of_changed_refs storage = function
   | [] -> Loaded []
   | [ _, tree ] -> Edited { storage; tree }
   | children -> Edited { storage; tree = Edited_branch (children, None) }
+
+let in_memory_storage () =
+  { store_node = (fun _ -> invalid_arg "in-memory tree cannot store refs")
+  ; restore_node = (fun _ -> invalid_arg "in-memory tree cannot restore refs")
+  ; accessed = (fun _ -> invalid_arg "in-memory tree cannot access refs")
+  }
 
 let add_to_stored_chunks settings order_cmp equality_cmp value stored_chunks =
   let rec loop acc = function
@@ -279,7 +353,46 @@ let add ?cmp value set =
        ; stored_chunks = []
        ; stored_branch_chunks = []
        })
-  | Loaded _ | Edited _ ->
+  | Tree tree ->
+    if set.stored_chunks <> [] then (
+      let previous_values = materialize_tree tree in
+      let values = insert_unique set.cmp equality_cmp value previous_values in
+      let stored_chunks =
+        if values = previous_values then set.stored_chunks
+        else add_to_stored_chunks set.set_settings set.cmp equality_cmp value set.stored_chunks
+      in
+      { set with
+        data = data_of_sorted_values set.set_settings values
+      ; root_address = (if values = previous_values then set.root_address else None)
+      ; stored_addresses = (if values = previous_values then set.stored_addresses else None)
+      ; stored_chunks
+      })
+    else
+      (match add_to_edited_tree (in_memory_storage ()) set.set_settings set.cmp equality_cmp value tree with
+       | Edit_unchanged -> set
+       | Edit_changed changed ->
+         { set with
+           data =
+             (match tree_of_refs set.set_settings changed with
+              | None -> Loaded []
+              | Some tree -> Tree tree)
+         ; root_address = None
+         ; stored_addresses = None
+         ; stored_chunks = []
+         ; stored_branch_chunks = []
+         })
+  | Edited { storage; tree } ->
+    (match add_to_edited_tree storage set.set_settings set.cmp equality_cmp value tree with
+     | Edit_unchanged -> set
+     | Edit_changed changed ->
+       { set with
+         data = edited_data_of_changed_refs storage changed
+       ; root_address = None
+       ; stored_addresses = None
+       ; stored_chunks = []
+       ; stored_branch_chunks = []
+       })
+  | Loaded _ ->
     let previous_values = materialize set in
     let values = insert_unique set.cmp equality_cmp value previous_values in
     let stored_chunks =
@@ -287,7 +400,7 @@ let add ?cmp value set =
       else add_to_stored_chunks set.set_settings set.cmp equality_cmp value set.stored_chunks
     in
     { set with
-      data = Loaded values
+      data = data_of_sorted_values set.set_settings values
     ; root_address = (if values = previous_values then set.root_address else None)
     ; stored_addresses = (if values = previous_values then set.stored_addresses else None)
     ; stored_chunks
@@ -310,7 +423,12 @@ let distinct_sorted_values cmp values =
 
 let of_sorted_array_by ?settings cmp values =
   let set = empty_by ?settings cmp in
-  { set with data = Loaded (values |> Array.to_list |> distinct_sorted_values set.cmp) }
+  let values_list = ref [] in
+  for i = Array.length values - 1 downto 0 do
+    values_list := values.(i) :: !values_list
+  done;
+  let values = distinct_sorted_values set.cmp !values_list in
+  { set with data = data_of_sorted_values set.set_settings values }
 
 let of_sorted_array values = of_sorted_array_by default_cmp values
 
@@ -348,7 +466,46 @@ let remove ?cmp value set =
        ; stored_chunks = []
        ; stored_branch_chunks = []
        })
-  | Loaded _ | Edited _ ->
+  | Tree tree ->
+    if set.stored_chunks <> [] then (
+      let previous_values = materialize_tree tree in
+      let values = remove_by set.cmp equality_cmp value previous_values in
+      let stored_chunks =
+        if values = previous_values then set.stored_chunks
+        else remove_from_stored_chunks set.cmp equality_cmp value set.stored_chunks
+      in
+      { set with
+        data = data_of_sorted_values set.set_settings values
+      ; root_address = (if values = previous_values then set.root_address else None)
+      ; stored_addresses = (if values = previous_values then set.stored_addresses else None)
+      ; stored_chunks
+      })
+    else
+      (match remove_from_edited_tree (in_memory_storage ()) set.set_settings set.cmp equality_cmp value tree with
+       | Edit_unchanged -> set
+       | Edit_changed changed ->
+         { set with
+           data =
+             (match tree_of_refs set.set_settings changed with
+              | None -> Loaded []
+              | Some tree -> Tree tree)
+         ; root_address = None
+         ; stored_addresses = None
+         ; stored_chunks = []
+         ; stored_branch_chunks = []
+         })
+  | Edited { storage; tree } ->
+    (match remove_from_edited_tree storage set.set_settings set.cmp equality_cmp value tree with
+     | Edit_unchanged -> set
+     | Edit_changed changed ->
+       { set with
+         data = edited_data_of_changed_refs storage changed
+       ; root_address = None
+       ; stored_addresses = None
+       ; stored_chunks = []
+       ; stored_branch_chunks = []
+       })
+  | Loaded _ ->
     let previous_values = materialize set in
     let values = remove_by set.cmp equality_cmp value previous_values in
     let stored_chunks =
@@ -356,7 +513,7 @@ let remove ?cmp value set =
       else remove_from_stored_chunks set.cmp equality_cmp value set.stored_chunks
     in
     { set with
-      data = Loaded values
+      data = data_of_sorted_values set.set_settings values
     ; root_address = (if values = previous_values then set.root_address else None)
     ; stored_addresses = (if values = previous_values then set.stored_addresses else None)
     ; stored_chunks
@@ -389,7 +546,7 @@ let rec search_deferred storage order_cmp equality_cmp value address =
     let rec choose_child keys child_addresses =
       match keys, child_addresses with
       | [], [] -> None
-      | key :: _, child_address :: _ when order_cmp value key <= 0 -> Some child_address
+      | key :: _, child_address :: _ when route_cmp order_cmp equality_cmp value key <= 0 -> Some child_address
       | _ :: keys, _ :: child_addresses -> choose_child keys child_addresses
       | [], _ :: _ | _ :: _, [] -> invalid_arg "branch keys and addresses arity mismatch"
     in
@@ -403,6 +560,29 @@ let mem_in_deferred storage order_cmp equality_cmp value address =
   | Found -> true
   | Stop | Continue -> false
 
+let rec search_edited_tree storage order_cmp equality_cmp value = function
+  | Edited_ref (_, address) -> search_deferred storage order_cmp equality_cmp value address
+  | Edited_leaf (values, _) ->
+    if mem_by order_cmp equality_cmp value values then Found
+    else
+      (match last values with
+       | Some last_value when order_cmp value last_value <= 0 -> Stop
+       | _ -> Continue)
+  | Edited_branch (children, _) ->
+    let rec choose_child = function
+      | [] -> None
+      | (key, child) :: _ when route_cmp order_cmp equality_cmp value key <= 0 -> Some child
+      | _ :: rest -> choose_child rest
+    in
+    (match choose_child children with
+     | Some child -> search_edited_tree storage order_cmp equality_cmp value child
+     | None -> Continue)
+
+let mem_in_edited_tree storage order_cmp equality_cmp value tree =
+  match search_edited_tree storage order_cmp equality_cmp value tree with
+  | Found -> true
+  | Stop | Continue -> false
+
 let mem ?cmp value set =
   let equality_cmp =
     match cmp with
@@ -411,14 +591,38 @@ let mem ?cmp value set =
   in
   match set.data with
   | Loaded values -> mem_by set.cmp equality_cmp value values
+  | Tree tree -> mem_in_edited_tree (in_memory_storage ()) set.cmp equality_cmp value tree
   | Deferred { storage; address } -> mem_in_deferred storage set.cmp equality_cmp value address
-  | Edited _ -> mem_by set.cmp equality_cmp value (materialize set)
+  | Edited { storage; tree } -> mem_in_edited_tree storage set.cmp equality_cmp value tree
 
-let count (set : 'a t) = List.length (materialize set)
+let rec fold_edited_tree storage f init = function
+  | Edited_ref (_, address) -> List.fold_left f init (materialize_address storage address)
+  | Edited_leaf (values, _) -> List.fold_left f init values
+  | Edited_branch (children, _) ->
+    List.fold_left
+      (fun acc (_, child) -> fold_edited_tree storage f acc child)
+      init
+      children
+
+let rec fold_tree f init = function
+  | Edited_ref _ -> invalid_arg "in-memory tree cannot contain stored refs"
+  | Edited_leaf (values, _) -> List.fold_left f init values
+  | Edited_branch (children, _) ->
+    List.fold_left (fun acc (_, child) -> fold_tree f acc child) init children
+
+let count (set : 'a t) =
+  match set.data with
+  | Tree tree -> fold_tree (fun count _ -> count + 1) 0 tree
+  | Edited { storage; tree } -> fold_edited_tree storage (fun count _ -> count + 1) 0 tree
+  | Loaded _ | Deferred _ -> List.length (materialize set)
 
 let to_list (set : 'a t) = materialize set
 
-let fold f init set = List.fold_left f init (materialize set)
+let fold f init set =
+  match set.data with
+  | Tree tree -> fold_tree f init tree
+  | Edited { storage; tree } -> fold_edited_tree storage f init tree
+  | Loaded _ | Deferred _ -> List.fold_left f init (materialize set)
 
 let fold_list f init values = List.fold_left f init values
 
@@ -497,7 +701,7 @@ let rec reverse_slice_deferred storage cmp from_ to_ address =
       | (previous_key, key, child_address) :: rest ->
         let child_above_range =
           match from_, previous_key with
-          | Some from_, Some previous_key -> cmp previous_key from_ >= 0
+          | Some from_, Some previous_key -> cmp previous_key from_ > 0
           | _ -> false
         in
         let child_below_range =
@@ -518,6 +722,7 @@ let slice ?from_ ?to_ ?cmp (set : 'a t) =
   let cmp = Option.value ~default:set.cmp cmp in
   match set.data with
   | Loaded values -> slice_values cmp from_ to_ values
+  | Tree tree -> slice_values cmp from_ to_ (materialize_tree tree)
   | Deferred { storage; address } -> slice_deferred storage cmp from_ to_ address
   | Edited _ -> slice_values cmp from_ to_ (materialize set)
 
@@ -525,12 +730,14 @@ let rslice ?from_ ?to_ ?cmp (set : 'a t) =
   let cmp = Option.value ~default:set.cmp cmp in
   match set.data with
   | Loaded values -> reverse_slice_values cmp from_ to_ values
+  | Tree tree -> reverse_slice_values cmp from_ to_ (materialize_tree tree)
   | Deferred { storage; address } -> reverse_slice_deferred storage cmp from_ to_ address
   | Edited _ -> reverse_slice_values cmp from_ to_ (materialize set)
 
 let seq_source_of_set set =
   match set.data with
   | Loaded values -> Seq_values values
+  | Tree tree -> Seq_values (materialize_tree tree)
   | Deferred { storage; address } -> Seq_deferred { storage; address }
   | Edited _ -> Seq_values (materialize set)
 
@@ -677,7 +884,7 @@ let store storage set =
        ; stored_chunks = []
        ; stored_branch_chunks = []
        }
-     | Loaded _ | Deferred _ | Edited _ ->
+     | Loaded _ | Tree _ | Deferred _ | Edited _ ->
        let values = materialize set in
        let preferred_chunks = List.map fst set.stored_chunks in
        let leaf_chunks =
@@ -765,7 +972,7 @@ let walk_addresses set =
   | Some address ->
     (match set.data with
      | Deferred { storage; address } -> walk_storage_addresses storage address
-     | Loaded _ | Edited _ ->
+     | Loaded _ | Tree _ | Edited _ ->
        if set.stored_branch_chunks <> [] then
          walk_branch_chunk_addresses set.stored_branch_chunks address
        else

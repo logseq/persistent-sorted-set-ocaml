@@ -876,6 +876,55 @@ let test_restored_add_preserves_unchanged_leaf_addresses_lazily () =
     (walk_addresses appended_stored);
   assert_equal_list "restored add keeps sorted values" (irange 0 101) (to_list appended_stored)
 
+let test_chained_restored_adds_keep_edit_path_without_rebuilding () =
+  let memory = Hashtbl.create 16 in
+  let writes = ref 0 in
+  let reads = ref 0 in
+  let accessed = ref [] in
+  let storage =
+    { store_node =
+        (fun node ->
+          incr writes;
+          let address = "node-" ^ string_of_int !writes in
+          Hashtbl.replace memory address node;
+          address)
+    ; restore_node =
+        (fun address ->
+          incr reads;
+          Hashtbl.find_opt memory address)
+    ; accessed = (fun address -> accessed := address :: !accessed)
+    }
+  in
+  let root, _ = store storage (of_list (irange 0 100)) in
+  reads := 0;
+  accessed := [];
+  let restored =
+    match restore ~cmp:compare storage root with
+    | Some restored -> restored
+    | None -> failwith "restore should find the stored root"
+  in
+  let appended_once = add 101 restored in
+  assert_equal_int "first restored add reads root and target leaf" 2 !reads;
+  assert_equal_list "first restored add accesses root and target leaf" [ "node-4"; root ] !accessed;
+  reads := 0;
+  accessed := [];
+  let appended_twice = add 102 appended_once in
+  assert_equal_int "second add should update the edited leaf without reading siblings" 0 !reads;
+  assert_equal_list "second add should not access stored siblings" [] !accessed;
+  reads := 0;
+  accessed := [];
+  let appended_duplicate = add 102 appended_twice in
+  assert_equal_int "duplicate add should check the edited leaf without reading siblings" 0 !reads;
+  assert_equal_list "duplicate add should not access stored siblings" [] !accessed;
+  let appended_root, appended_stored = store storage appended_duplicate in
+  if appended_root = root then failwith "chained restored adds should create a new root";
+  assert_equal_int "chained restored adds should write one final leaf and one new root" 7 !writes;
+  assert_equal_list
+    "chained restored adds reuse unchanged leaf addresses"
+    [ appended_root; "node-1"; "node-2"; "node-3"; "node-6" ]
+    (walk_addresses appended_stored);
+  assert_equal_list "chained restored adds keep sorted values" (irange 0 102) (to_list appended_stored)
+
 let test_restored_remove_preserves_unchanged_leaf_addresses_lazily () =
   let memory = Hashtbl.create 16 in
   let writes = ref 0 in
@@ -1426,6 +1475,7 @@ let () =
   test_storage_remove_preserves_unchanged_leaf_addresses ();
   test_storage_add_preserves_unchanged_leaf_addresses ();
   test_restored_add_preserves_unchanged_leaf_addresses_lazily ();
+  test_chained_restored_adds_keep_edit_path_without_rebuilding ();
   test_restored_remove_preserves_unchanged_leaf_addresses_lazily ();
   test_restored_mem_reads_only_needed_leaves ();
   test_restored_slice_reads_only_overlapping_leaves ();
