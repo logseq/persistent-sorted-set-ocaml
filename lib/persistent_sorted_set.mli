@@ -5,7 +5,6 @@ type settings =
   }
 
 type 'a stored_node =
-  | Values of 'a list
   | Leaf of 'a list
   | Branch of 'a list * string list
 

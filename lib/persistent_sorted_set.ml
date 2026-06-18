@@ -5,7 +5,6 @@ type settings =
   }
 
 type 'a stored_node =
-  | Values of 'a list
   | Leaf of 'a list
   | Branch of 'a list * string list
 
@@ -116,7 +115,6 @@ let chunks size values =
 let rec materialize_address storage address =
   storage.accessed address;
   match storage.restore_node address with
-  | Some (Values values)
   | Some (Leaf values) ->
     values
   | Some (Branch (_, child_addresses)) ->
@@ -249,7 +247,6 @@ let data_of_sorted_values settings values =
 
 let rec add_to_address storage settings order_cmp equality_cmp value address =
   match restore_stored_node storage address with
-  | Values values
   | Leaf values ->
     let inserted = insert_unique order_cmp equality_cmp value values in
     if inserted = values then Edit_unchanged
@@ -292,7 +289,6 @@ let rec add_to_edited_tree storage settings order_cmp equality_cmp value = funct
 
 let rec remove_from_address storage settings order_cmp equality_cmp value address =
   match restore_stored_node storage address with
-  | Values values
   | Leaf values ->
     let removed = remove_by order_cmp equality_cmp value values in
     if removed = values then Edit_unchanged
@@ -762,7 +758,6 @@ type search_step =
 let rec search_deferred storage order_cmp equality_cmp value address =
   storage.accessed address;
   match storage.restore_node address with
-  | Some (Values values)
   | Some (Leaf values) ->
     if mem_by order_cmp equality_cmp value values then Found
     else
@@ -920,7 +915,6 @@ let reverse_slice_values cmp from_ to_ values =
 let rec slice_deferred storage cmp from_ to_ address =
   storage.accessed address;
   match storage.restore_node address with
-  | Some (Values values)
   | Some (Leaf values) ->
     slice_values cmp from_ to_ values
   | Some (Branch (keys, child_addresses)) ->
@@ -941,7 +935,6 @@ let rec slice_deferred storage cmp from_ to_ address =
 let rec reverse_slice_deferred storage cmp from_ to_ address =
   storage.accessed address;
   match storage.restore_node address with
-  | Some (Values values)
   | Some (Leaf values) ->
     reverse_slice_values cmp from_ to_ values
   | Some (Branch (keys, child_addresses)) ->
@@ -1203,7 +1196,6 @@ let rec walk_storage_addresses storage address =
   match storage.restore_node address with
   | Some (Branch (_, child_addresses)) ->
     address :: List.concat_map (walk_storage_addresses storage) child_addresses
-  | Some (Values _)
   | Some (Leaf _) ->
     [ address ]
   | None -> invalid_arg ("stored node not found: " ^ address)
