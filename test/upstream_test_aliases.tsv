@@ -14,5 +14,5 @@ stress.cljc	stresstest-seek	test_upstream_stresstest_seek_parity
 stress.cljc	test-overflow	test_upstream_overflow_batched_insert_smoke
 storage.clj	test-lazy-remove	test_nested_storage_remove_reuses_unchanged_branch_addresses
 storage.clj	stresstest-stable-addresses	test_storage_round_trip_and_stable_addresses
-storage.clj	test-walk	test_restored_walk_addresses_visits_stored_descendants
+storage.clj	test-walk	test_storage_addresses_visit_stored_descendants
 storage.clj	test-lazyness	test_restored_seq_seek_is_lazy

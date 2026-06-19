@@ -1,20 +1,21 @@
 open Persistent_sorted_set
 
-type config =
-  { warmup_ms : float
-  ; sample_ms : float
-  ; samples : int
-  ; names : string list
-  }
+type config = {
+  warmup_ms : float;
+  sample_ms : float;
+  samples : int;
+  names : string list;
+}
 
 let default_names =
-  [ "conj-10K"
-  ; "disj-10K"
-  ; "contains-10K"
-  ; "doseq-300K"
-  ; "next-300K"
-  ; "reduce-300K"
-  ; "restored-chained-add-10K"
+  [
+    "conj-10K";
+    "disj-10K";
+    "contains-10K";
+    "doseq-300K";
+    "next-300K";
+    "reduce-300K";
+    "restored-chained-add-10K";
   ]
 
 let default_config =
@@ -22,22 +23,25 @@ let default_config =
 
 let parse_args () =
   let config = ref { default_config with names = [] } in
-  let add_name name = config := { !config with names = !config.names @ [ name ] } in
+  let add_name name =
+    config := { !config with names = !config.names @ [ name ] }
+  in
   let rec loop = function
     | [] ->
-      if !config.names = [] then { !config with names = default_names } else !config
+        if !config.names = [] then { !config with names = default_names }
+        else !config
     | "--warmup-ms" :: value :: rest ->
-      config := { !config with warmup_ms = float_of_string value };
-      loop rest
+        config := { !config with warmup_ms = float_of_string value };
+        loop rest
     | "--sample-ms" :: value :: rest ->
-      config := { !config with sample_ms = float_of_string value };
-      loop rest
+        config := { !config with sample_ms = float_of_string value };
+        loop rest
     | "--samples" :: value :: rest ->
-      config := { !config with samples = int_of_string value };
-      loop rest
+        config := { !config with samples = int_of_string value };
+        loop rest
     | name :: rest ->
-      add_name name;
-      loop rest
+        add_name name;
+        loop rest
   in
   Sys.argv |> Array.to_list |> List.tl |> loop
 
@@ -65,32 +69,32 @@ let shuffled_array size =
   values
 
 let ints_10k = shuffled_array 10_000
-
 let set_10k = lazy (of_sorted_array (Array.init 10_000 Fun.id))
 let set_300k = lazy (of_sorted_array (Array.init 300_000 Fun.id))
-
 let blackhole = ref 0
-
-let consume_int value =
-  blackhole := (!blackhole + value) land 0x3fffffff
+let consume_int value = blackhole := (!blackhole + value) land 0x3fffffff
 
 let build_storage () =
   let memory = Hashtbl.create 1024 in
   let next_address = ref 0 in
-  { store_node =
+  {
+    store_node =
       (fun node ->
         incr next_address;
         let address = "node-" ^ string_of_int !next_address in
         Hashtbl.replace memory address node;
-        address)
-  ; restore_node = (fun address -> Hashtbl.find_opt memory address)
-  ; accessed = (fun _ -> ())
+        address);
+    restore_node = (fun address -> Hashtbl.find_opt memory address);
+    accessed = (fun _ -> ());
   }
 
-let restored_10k = lazy (
-  let storage = build_storage () in
-  let root, _ = store storage (Lazy.force set_10k) in
-  root, storage)
+let restored_10k =
+  lazy
+    (let storage = build_storage () in
+     let root, _ =
+       store (of_sorted_array_by ~storage compare (Array.init 10_000 Fun.id))
+     in
+     (root, storage))
 
 let bench_conj_10k () =
   let set = ref (empty ()) in
@@ -128,23 +132,18 @@ let bench_restored_chained_add_10k () =
   match restore ~cmp:compare restored_10k_storage restored_10k_root with
   | None -> invalid_arg "restored benchmark root missing"
   | Some restored ->
-    restored
-    |> add 10_000
-    |> add 10_001
-    |> add 10_001
-    |> store restored_10k_storage
-    |> fst
-    |> String.length
-    |> consume_int
+      restored |> add 10_000 |> add 10_001 |> add 10_001 |> store |> fst
+      |> String.length |> consume_int
 
 let benches =
-  [ "conj-10K", bench_conj_10k
-  ; "disj-10K", bench_disj_10k
-  ; "contains-10K", bench_contains_10k
-  ; "doseq-300K", bench_doseq_300k
-  ; "next-300K", bench_next_300k
-  ; "reduce-300K", bench_reduce_300k
-  ; "restored-chained-add-10K", bench_restored_chained_add_10k
+  [
+    ("conj-10K", bench_conj_10k);
+    ("disj-10K", bench_disj_10k);
+    ("contains-10K", bench_contains_10k);
+    ("doseq-300K", bench_doseq_300k);
+    ("next-300K", bench_next_300k);
+    ("reduce-300K", bench_reduce_300k);
+    ("restored-chained-add-10K", bench_restored_chained_add_10k);
   ]
 
 let run_for duration_ms f =
@@ -153,7 +152,8 @@ let run_for duration_ms f =
   let rec loop iterations =
     f ();
     let iterations = iterations + 1 in
-    if now_ms () < deadline then loop iterations else iterations, now_ms () -. start
+    if now_ms () < deadline then loop iterations
+    else (iterations, now_ms () -. start)
   in
   loop 0
 
@@ -161,17 +161,16 @@ let bench config name f =
   ignore (run_for config.warmup_ms f);
   let samples =
     List.init config.samples (fun _ ->
-      let iterations, elapsed = run_for config.sample_ms f in
-      elapsed /. float_of_int iterations)
+        let iterations, elapsed = run_for config.sample_ms f in
+        elapsed /. float_of_int iterations)
   in
   Printf.printf "%s\t%s\n%!" name (format_ms (median samples))
 
 let () =
   let config = parse_args () in
-  Printf.printf "OCaml PSS benchmark\twarmup-ms=%.0f\tsample-ms=%.0f\tsamples=%d\n%!"
-    config.warmup_ms
-    config.sample_ms
-    config.samples;
+  Printf.printf
+    "OCaml PSS benchmark\twarmup-ms=%.0f\tsample-ms=%.0f\tsamples=%d\n%!"
+    config.warmup_ms config.sample_ms config.samples;
   List.iter
     (fun name ->
       match List.assoc_opt name benches with
