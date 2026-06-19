@@ -2,3 +2,8 @@
  (name bench_pss)
  (modes exe js)
  (libraries persistent_sorted_set unix))
+
+(rule
+ (alias bench)
+ (action
+  (run ./bench_pss.exe)))
