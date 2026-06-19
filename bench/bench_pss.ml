@@ -92,7 +92,8 @@ let restored_10k =
   lazy
     (let storage = build_storage () in
      let root, _ =
-       store (of_sorted_array_by ~storage compare (Array.init 10_000 Fun.id))
+       store
+         (of_sorted_array_by ~storage ~cmp:compare (Array.init 10_000 Fun.id))
      in
      (root, storage))
 

@@ -80,7 +80,7 @@ let roundtrip_set set =
       accessed = (fun _ -> ());
     }
   in
-  let root, _ = store (of_list_by ~storage compare (to_list set)) in
+  let root, _ = store (of_list_by ~storage ~cmp:compare (to_list set)) in
   match restore ~cmp:compare storage root with
   | Some restored -> restored
   | None -> failwith "roundtrip_set should restore the stored root"
@@ -99,6 +99,24 @@ let compare_pair_with_nil_wildcard (x0, x1) (y0, y1) =
 let quotient_compare divisor left right =
   compare (left / divisor) (right / divisor)
 
+let bucket_representatives divisor values =
+  let seen = Hashtbl.create 16 in
+  values
+  |> List.filter (fun value ->
+      let bucket = value / divisor in
+      if Hashtbl.mem seen bucket then false
+      else (
+        Hashtbl.add seen bucket ();
+        true))
+  |> List.sort (quotient_compare divisor)
+
+let bucket_range divisor ~from_ ~to_ values =
+  List.filter
+    (fun value ->
+      let bucket = value / divisor in
+      bucket >= from_ / divisor && bucket <= to_ / divisor)
+    values
+
 let test_settings_control_storage_branching_factor () =
   let memory = Hashtbl.create 16 in
   let writes = ref 0 in
@@ -116,7 +134,7 @@ let test_settings_control_storage_branching_factor () =
   in
   let custom_settings = { branching_factor = 4 } in
   let set =
-    of_list_by ~storage ~settings:custom_settings compare (irange 0 9)
+    of_list_by ~storage ~settings:custom_settings ~cmp:compare (irange 0 9)
   in
   if settings set <> custom_settings then
     failwith "settings should expose custom branching factor";
@@ -137,7 +155,7 @@ let test_settings_control_storage_branching_factor () =
   | None -> failwith "custom root should be stored");
   if settings (empty ()) <> default_settings then
     failwith "empty should use default settings";
-  let default_root, _ = store (of_list_by ~storage compare (irange 0 9)) in
+  let default_root, _ = store (of_list_by ~storage ~cmp:compare (irange 0 9)) in
   match Hashtbl.find_opt memory default_root with
   | Some (Leaf values) ->
       assert_equal_list "default branching factor keeps small sets in one leaf"
@@ -168,7 +186,8 @@ let test_restore_preserves_settings_for_later_edits () =
   in
   let custom_settings = { branching_factor = 4 } in
   let root, _ =
-    store (of_list_by ~storage ~settings:custom_settings compare (irange 0 15))
+    store
+      (of_list_by ~storage ~settings:custom_settings ~cmp:compare (irange 0 15))
   in
   assert_equal_int "custom restore setup writes four leaves plus root" 5 !writes;
   reads := 0;
@@ -218,10 +237,12 @@ let test_restore_preserves_settings_for_later_edits () =
 
 let test_settings_validate_branching_factor () =
   assert_raises_invalid_arg "empty_by rejects branching factors below two"
-    (fun () -> ignore (empty_by ~settings:{ branching_factor = 1 } compare));
+    (fun () ->
+      ignore (empty_by ~settings:{ branching_factor = 1 } ~cmp:compare ()));
   assert_raises_invalid_arg "of_list_by rejects non-positive branching factors"
     (fun () ->
-      ignore (of_list_by ~settings:{ branching_factor = 0 } compare [ 1; 2; 3 ]));
+      ignore
+        (of_list_by ~settings:{ branching_factor = 0 } ~cmp:compare [ 1; 2; 3 ]));
   let memory = Hashtbl.create 1 in
   let storage =
     {
@@ -255,7 +276,7 @@ let test_of_sorted_array_uses_sorted_input_and_settings () =
   in
   let custom_settings = { branching_factor = 3 } in
   let set =
-    of_sorted_array_by ~storage ~settings:custom_settings compare
+    of_sorted_array_by ~storage ~settings:custom_settings ~cmp:compare
       [| 0; 1; 1; 2; 3; 3; 4; 5; 6 |]
   in
   assert_equal_list "of_sorted_array_by drops adjacent comparator-equal values"
@@ -280,7 +301,9 @@ let test_of_sorted_array_uses_sorted_input_and_settings () =
       failwith "of_sorted_array_by custom settings should create a branch root"
   | None -> failwith "of_sorted_array_by root should be stored");
   let descending =
-    of_sorted_array_by (fun left right -> compare right left) [| 9; 7; 7; 5 |]
+    of_sorted_array_by
+      ~cmp:(fun left right -> compare right left)
+      [| 9; 7; 7; 5 |]
   in
   assert_equal_list "of_sorted_array_by respects custom comparator order"
     [ 9; 7; 5 ] (to_list descending);
@@ -299,67 +322,74 @@ let test_sorted_order_and_uniqueness () =
   assert_equal_list "remove deletes present values" [ 1; 2; 4 ]
     (to_list (remove 3 with_duplicates))
 
-let test_custom_comparator_and_override_compare () =
+let test_custom_comparator_and_uniqueness () =
   let descending =
-    of_list_by (fun left right -> compare right left) [ 1; 2; 3 ]
+    of_list_by ~cmp:(fun left right -> compare right left) [ 1; 2; 3 ]
   in
   assert_equal_list "custom comparator controls order" [ 3; 2; 1 ]
     (to_list descending);
   let values = shuffled (irange 0 120) in
+  let representatives = bucket_representatives 10 values in
   let grouped =
     List.fold_left
-      (fun set value -> add ~cmp:compare value set)
-      (empty_by (quotient_compare 10))
+      (fun set value -> add value set)
+      (empty_by ~cmp:(quotient_compare 10) ())
       values
   in
-  assert_equal_list "override compare lets comparator-equal values coexist"
-    (irange 30 39)
+  assert_equal_list "custom comparator keeps one value per comparator bucket"
+    representatives (to_list grouped);
+  assert_equal_list "slice returns the representative for one comparator bucket"
+    (bucket_range 10 ~from_:30 ~to_:30 representatives)
     (slice ~from_:30 ~to_:30 grouped)
 
 let test_equal_comparator_slice_ranges () =
+  let values10 = shuffled (irange 0 5000) in
+  let representatives10 = bucket_representatives 10 values10 in
   let set10 =
     List.fold_left
-      (fun set value -> add ~cmp:compare value set)
-      (empty_by (quotient_compare 10))
-      (shuffled (irange 0 5000))
+      (fun set value -> add value set)
+      (empty_by ~cmp:(quotient_compare 10) ())
+      values10
   in
   assert_equal_list
-    "slice returns all members comparator-equal to a single bound"
-    (irange 30 39)
+    "slice returns the representative comparator-equal to a single bound"
+    (bucket_range 10 ~from_:30 ~to_:30 representatives10)
     (slice ~from_:30 ~to_:30 set10);
-  assert_equal_list
-    "slice returns all comparator-equal members across a grouped range"
-    (irange 130 4979)
+  assert_equal_list "slice returns representatives across a grouped range"
+    (bucket_range 10 ~from_:130 ~to_:4970 representatives10)
     (slice ~from_:130 ~to_:4970 set10);
   assert_equal_list
-    "reverse slice returns all members comparator-equal to a single bound"
-    (irange 39 30)
+    "reverse slice returns the representative comparator-equal to a single \
+     bound"
+    (List.rev (bucket_range 10 ~from_:30 ~to_:30 representatives10))
     (rslice ~from_:30 ~to_:30 set10);
   assert_equal_list
-    "reverse slice returns all comparator-equal members across a grouped range"
-    (irange 4979 130)
+    "reverse slice returns representatives across a grouped range"
+    (List.rev (bucket_range 10 ~from_:130 ~to_:4970 representatives10))
     (rslice ~from_:4970 ~to_:130 set10);
+  let values100 = shuffled (irange 0 5000) in
+  let representatives100 = bucket_representatives 100 values100 in
   let set100 =
     List.fold_left
-      (fun set value -> add ~cmp:compare value set)
-      (empty_by (quotient_compare 100))
-      (shuffled (irange 0 5000))
+      (fun set value -> add value set)
+      (empty_by ~cmp:(quotient_compare 100) ())
+      values100
   in
-  assert_equal_list "coarse slice includes the full lower comparator bucket"
-    (irange 0 99)
+  assert_equal_list
+    "coarse slice returns the lower comparator bucket representative"
+    (bucket_range 100 ~from_:30 ~to_:30 representatives100)
     (slice ~from_:30 ~to_:30 set100);
   assert_equal_list
-    "coarse slice includes full comparator buckets across a grouped range"
-    (irange 100 4899)
+    "coarse slice returns representatives across a grouped range"
+    (bucket_range 100 ~from_:130 ~to_:4850 representatives100)
     (slice ~from_:130 ~to_:4850 set100);
   assert_equal_list
-    "coarse reverse slice includes the full lower comparator bucket"
-    (irange 99 0)
+    "coarse reverse slice returns the lower comparator bucket representative"
+    (List.rev (bucket_range 100 ~from_:30 ~to_:30 representatives100))
     (rslice ~from_:30 ~to_:30 set100);
   assert_equal_list
-    "coarse reverse slice includes full comparator buckets across a grouped \
-     range"
-    (irange 4899 100)
+    "coarse reverse slice returns representatives across a grouped range"
+    (List.rev (bucket_range 100 ~from_:130 ~to_:4850 representatives100))
     (rslice ~from_:4850 ~to_:130 set100)
 
 let test_restored_equal_comparator_slice_ranges () =
@@ -377,11 +407,13 @@ let test_restored_equal_comparator_slice_ranges () =
       accessed = (fun _ -> ());
     }
   in
+  let values = shuffled (irange 0 5000) in
+  let representatives = bucket_representatives 10 values in
   let original =
     List.fold_left
-      (fun set value -> add ~cmp:compare value set)
-      (empty_by ~storage (quotient_compare 10))
-      (shuffled (irange 0 5000))
+      (fun set value -> add value set)
+      (empty_by ~storage ~cmp:(quotient_compare 10) ())
+      values
   in
   let root, _ = store original in
   let restored =
@@ -390,18 +422,17 @@ let test_restored_equal_comparator_slice_ranges () =
     | None -> failwith "restore should find the stored grouped set"
   in
   assert_equal_list
-    "restored slice returns all comparator-equal members across a grouped range"
-    (irange 130 4979)
+    "restored slice returns representatives across a grouped range"
+    (bucket_range 10 ~from_:130 ~to_:4970 representatives)
     (slice ~from_:130 ~to_:4970 restored);
   assert_equal_list
-    "restored reverse slice returns all comparator-equal members across a \
-     grouped range"
-    (irange 4979 130)
+    "restored reverse slice returns representatives across a grouped range"
+    (List.rev (bucket_range 10 ~from_:130 ~to_:4970 representatives))
     (rslice ~from_:4970 ~to_:130 restored)
 
 let test_pair_comparator_nil_wildcard_slices () =
   let set =
-    empty_by compare_pair_with_nil_wildcard
+    empty_by ~cmp:compare_pair_with_nil_wildcard ()
     |> add (Some "a", Some "b")
     |> add (Some "b", Some "x")
     |> add (Some "b", Some "q")
@@ -725,7 +756,7 @@ let test_storage_round_trip_and_stable_addresses () =
       accessed = (fun address -> accessed := address :: !accessed);
     }
   in
-  let original = of_list_by ~storage compare (irange 0 10) in
+  let original = of_list_by ~storage ~cmp:compare (irange 0 10) in
   let root, stored = store original in
   assert_equal_int "store writes the root once" 1 !writes;
   assert_equal_list "stored_addresses reports stored root" [ root ]
@@ -779,7 +810,7 @@ let test_storage_uses_leaf_and_branch_nodes_for_large_sets () =
       accessed = (fun address -> accessed := address :: !accessed);
     }
   in
-  let original = of_list_by ~storage compare (irange 0 100) in
+  let original = of_list_by ~storage ~cmp:compare (irange 0 100) in
   let root, stored = store original in
   let root_addresses = stored_addresses memory root in
   assert_equal_int "large store writes leaf nodes plus a root branch" 5 !writes;
@@ -837,7 +868,7 @@ let test_storage_remove_preserves_unchanged_leaf_addresses () =
       accessed = (fun _ -> ());
     }
   in
-  let original = of_list_by ~storage compare (irange 0 100) in
+  let original = of_list_by ~storage ~cmp:compare (irange 0 100) in
   let root, stored = store original in
   assert_equal_int "large store writes leaf nodes plus a root" 5 !writes;
   let removed = remove 50 stored in
@@ -882,7 +913,9 @@ let test_storage_add_preserves_unchanged_leaf_addresses () =
       accessed = (fun _ -> ());
     }
   in
-  let original = of_list_by ~storage compare (irange 0 49 @ irange 51 100) in
+  let original =
+    of_list_by ~storage ~cmp:compare (irange 0 49 @ irange 51 100)
+  in
   let root, stored = store original in
   assert_equal_int "large gapped store writes leaf nodes plus a root" 5 !writes;
   let added = add 50 stored in
@@ -933,7 +966,7 @@ let test_restored_add_preserves_unchanged_leaf_addresses_lazily () =
       accessed = (fun address -> accessed := address :: !accessed);
     }
   in
-  let original = of_list_by ~storage compare (irange 0 100) in
+  let original = of_list_by ~storage ~cmp:compare (irange 0 100) in
   let root, _ = store original in
   reads := 0;
   accessed := [];
@@ -976,7 +1009,7 @@ let test_chained_restored_adds_keep_edit_path_without_rebuilding () =
       accessed = (fun address -> accessed := address :: !accessed);
     }
   in
-  let root, _ = store (of_list_by ~storage compare (irange 0 100)) in
+  let root, _ = store (of_list_by ~storage ~cmp:compare (irange 0 100)) in
   reads := 0;
   accessed := [];
   let restored =
@@ -1034,7 +1067,7 @@ let test_restored_remove_preserves_unchanged_leaf_addresses_lazily () =
       accessed = (fun address -> accessed := address :: !accessed);
     }
   in
-  let original = of_list_by ~storage compare (irange 0 100) in
+  let original = of_list_by ~storage ~cmp:compare (irange 0 100) in
   let root, _ = store original in
   reads := 0;
   accessed := [];
@@ -1080,7 +1113,7 @@ let test_restored_mem_reads_only_needed_leaves () =
       accessed = (fun address -> accessed := address :: !accessed);
     }
   in
-  let original = of_list_by ~storage compare (irange 0 100) in
+  let original = of_list_by ~storage ~cmp:compare (irange 0 100) in
   let root, _ = store original in
   let restored =
     match restore ~cmp:compare storage root with
@@ -1131,7 +1164,7 @@ let test_restored_slice_reads_only_overlapping_leaves () =
       accessed = (fun address -> accessed := address :: !accessed);
     }
   in
-  let original = of_list_by ~storage compare (irange 0 100) in
+  let original = of_list_by ~storage ~cmp:compare (irange 0 100) in
   let root, _ = store original in
   let restored =
     match restore ~cmp:compare storage root with
@@ -1176,7 +1209,7 @@ let test_restored_reverse_slice_reads_only_overlapping_leaves () =
       accessed = (fun address -> accessed := address :: !accessed);
     }
   in
-  let original = of_list_by ~storage compare (irange 0 100) in
+  let original = of_list_by ~storage ~cmp:compare (irange 0 100) in
   let root, _ = store original in
   let restored =
     match restore ~cmp:compare storage root with
@@ -1225,7 +1258,7 @@ let test_restored_seq_seek_is_lazy () =
       accessed = (fun address -> accessed := address :: !accessed);
     }
   in
-  let root, _ = store (of_list_by ~storage compare (irange 0 100)) in
+  let root, _ = store (of_list_by ~storage ~cmp:compare (irange 0 100)) in
   let restored =
     match restore ~cmp:compare storage root with
     | Some restored -> restored
@@ -1264,7 +1297,7 @@ let test_restored_rseq_seek_is_lazy () =
       accessed = (fun address -> accessed := address :: !accessed);
     }
   in
-  let root, _ = store (of_list_by ~storage compare (irange 0 100)) in
+  let root, _ = store (of_list_by ~storage ~cmp:compare (irange 0 100)) in
   let restored =
     match restore ~cmp:compare storage root with
     | Some restored -> restored
@@ -1303,7 +1336,7 @@ let test_restored_slice_seq_construction_is_lazy () =
       accessed = (fun address -> accessed := address :: !accessed);
     }
   in
-  let root, _ = store (of_list_by ~storage compare (irange 0 100)) in
+  let root, _ = store (of_list_by ~storage ~cmp:compare (irange 0 100)) in
   let restored =
     match restore ~cmp:compare storage root with
     | Some restored -> restored
@@ -1345,7 +1378,7 @@ let test_restored_rslice_seq_construction_is_lazy () =
       accessed = (fun address -> accessed := address :: !accessed);
     }
   in
-  let root, _ = store (of_list_by ~storage compare (irange 0 100)) in
+  let root, _ = store (of_list_by ~storage ~cmp:compare (irange 0 100)) in
   let restored =
     match restore ~cmp:compare storage root with
     | Some restored -> restored
@@ -1385,7 +1418,7 @@ let test_storage_uses_nested_branch_nodes_for_very_large_sets () =
       accessed = (fun _ -> ());
     }
   in
-  let original = of_list_by ~storage compare (irange 0 1055) in
+  let original = of_list_by ~storage ~cmp:compare (irange 0 1055) in
   let root, _ = store original in
   assert_equal_int
     "very large store writes leaves, intermediate branches, and root" 36 !writes;
@@ -1454,7 +1487,7 @@ let test_storage_addresses_visit_stored_descendants () =
     (memory, storage)
   in
   let memory, storage = make_storage () in
-  let shallow_original = of_list_by ~storage compare (irange 0 100) in
+  let shallow_original = of_list_by ~storage ~cmp:compare (irange 0 100) in
   let shallow_root, _ = store shallow_original in
   (match restore ~cmp:compare storage shallow_root with
   | Some _ -> ()
@@ -1464,7 +1497,7 @@ let test_storage_addresses_visit_stored_descendants () =
     [ shallow_root; "node-1"; "node-2"; "node-3"; "node-4" ]
     (stored_addresses memory shallow_root);
   let memory, storage = make_storage () in
-  let nested_original = of_list_by ~storage compare (irange 0 1055) in
+  let nested_original = of_list_by ~storage ~cmp:compare (irange 0 1055) in
   let nested_root, _ = store nested_original in
   if List.length (stored_addresses memory nested_root) <> 36 then
     failwith
@@ -1495,7 +1528,7 @@ let test_nested_storage_remove_reuses_unchanged_branch_addresses () =
       accessed = (fun _ -> ());
     }
   in
-  let original = of_list_by ~storage compare (irange 0 1055) in
+  let original = of_list_by ~storage ~cmp:compare (irange 0 1055) in
   let root, stored = store original in
   if root <> "node-36" then failwith "initial nested root should be node-36";
   let removed = remove 50 stored in
@@ -1548,7 +1581,7 @@ let test_restored_nested_remove_reuses_unchanged_branch_addresses_lazily () =
       accessed = (fun address -> accessed := address :: !accessed);
     }
   in
-  let root, _ = store (of_list_by ~storage compare (irange 0 1055)) in
+  let root, _ = store (of_list_by ~storage ~cmp:compare (irange 0 1055)) in
   reads := 0;
   accessed := [];
   let restored =
@@ -1606,7 +1639,7 @@ let test_restored_nested_add_reuses_unchanged_branch_addresses_lazily () =
     }
   in
   let original_values = irange 0 49 @ irange 51 1055 in
-  let root, _ = store (of_list_by ~storage compare original_values) in
+  let root, _ = store (of_list_by ~storage ~cmp:compare original_values) in
   reads := 0;
   accessed := [];
   let restored =
@@ -1649,7 +1682,7 @@ let test_tree_slice_to_seq_seeks_lazily () =
     incr comparisons;
     compare left right
   in
-  let set = of_list_by cmp (irange 0 10_000) in
+  let set = of_list_by ~cmp (irange 0 10_000) in
   comparisons := 0;
   let seq = slice_seq ~from_:5_000 ~to_:9_000 set |> to_seq in
   (match Seq.uncons seq with
@@ -1668,7 +1701,7 @@ let () =
   test_settings_validate_branching_factor ();
   test_of_sorted_array_uses_sorted_input_and_settings ();
   test_sorted_order_and_uniqueness ();
-  test_custom_comparator_and_override_compare ();
+  test_custom_comparator_and_uniqueness ();
   test_equal_comparator_slice_ranges ();
   test_restored_equal_comparator_slice_ranges ();
   test_pair_comparator_nil_wildcard_slices ();
