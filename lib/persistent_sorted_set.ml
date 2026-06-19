@@ -958,11 +958,91 @@ let rec reverse_slice_deferred storage cmp from_ to_ address =
     collect [] child_refs
   | None -> invalid_arg ("stored node not found: " ^ address)
 
+let slice_array_into cmp from_ to_ values acc =
+  let rec loop acc index =
+    if index >= Array.length values then acc
+    else
+      let value = values.(index) in
+      if not (lower_ok cmp from_ value) then loop acc (index + 1)
+      else if not (upper_ok cmp to_ value) then acc
+      else loop (value :: acc) (index + 1)
+  in
+  loop acc 0
+
+let reverse_slice_array_into cmp from_ to_ values acc =
+  let rec loop acc index =
+    if index < 0 then acc
+    else
+      let value = values.(index) in
+      let in_range =
+        match from_, to_ with
+        | None, None -> true
+        | Some from_, None -> cmp value from_ <= 0
+        | None, Some to_ -> cmp value to_ >= 0
+        | Some from_, Some to_ -> cmp value from_ <= 0 && cmp value to_ >= 0
+      in
+      if in_range then loop (value :: acc) (index - 1)
+      else
+        match from_ with
+        | Some from_ when cmp value from_ > 0 -> loop acc (index - 1)
+        | _ -> acc
+  in
+  loop acc (Array.length values - 1)
+
+let rec slice_tree_into cmp from_ to_ tree acc =
+  match tree with
+  | Tree_leaf values -> slice_array_into cmp from_ to_ values acc
+  | Tree_branch (keys, children) ->
+    let rec collect previous_key acc index =
+      if index >= Array.length children then acc
+      else
+        let key = keys.(index) in
+        if child_after_range cmp to_ previous_key then acc
+        else if child_before_range cmp from_ key then collect (Some key) acc (index + 1)
+        else
+          let acc = slice_tree_into cmp from_ to_ children.(index) acc in
+          collect (Some key) acc (index + 1)
+    in
+    collect None acc 0
+
+let slice_tree cmp from_ to_ tree =
+  List.rev (slice_tree_into cmp from_ to_ tree [])
+
+let rec reverse_slice_tree_into cmp from_ to_ tree acc =
+  match tree with
+  | Tree_leaf values -> reverse_slice_array_into cmp from_ to_ values acc
+  | Tree_branch (keys, children) ->
+    let rec collect acc index =
+      if index < 0 then acc
+      else
+        let key = keys.(index) in
+        let previous_key = if index = 0 then None else Some keys.(index - 1) in
+        let child_above_range =
+          match from_, previous_key with
+          | Some from_, Some previous_key -> cmp previous_key from_ > 0
+          | _ -> false
+        in
+        let child_below_range =
+          match to_ with
+          | Some to_ -> cmp key to_ < 0
+          | None -> false
+        in
+        if child_above_range then collect acc (index - 1)
+        else if child_below_range then acc
+        else
+          let acc = reverse_slice_tree_into cmp from_ to_ children.(index) acc in
+          collect acc (index - 1)
+    in
+    collect acc (Array.length children - 1)
+
+let reverse_slice_tree cmp from_ to_ tree =
+  List.rev (reverse_slice_tree_into cmp from_ to_ tree [])
+
 let slice ?from_ ?to_ ?cmp (set : 'a t) =
   let cmp = Option.value ~default:set.cmp cmp in
   match set.data with
   | Empty -> []
-  | Tree tree -> slice_values cmp from_ to_ (materialize_tree tree)
+  | Tree tree -> slice_tree cmp from_ to_ tree
   | Deferred { storage; address } -> slice_deferred storage cmp from_ to_ address
   | Edited _ -> slice_values cmp from_ to_ (materialize set)
 
@@ -970,7 +1050,7 @@ let rslice ?from_ ?to_ ?cmp (set : 'a t) =
   let cmp = Option.value ~default:set.cmp cmp in
   match set.data with
   | Empty -> []
-  | Tree tree -> reverse_slice_values cmp from_ to_ (materialize_tree tree)
+  | Tree tree -> reverse_slice_tree cmp from_ to_ tree
   | Deferred { storage; address } -> reverse_slice_deferred storage cmp from_ to_ address
   | Edited _ -> reverse_slice_values cmp from_ to_ (materialize set)
 
