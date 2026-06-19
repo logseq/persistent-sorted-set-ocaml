@@ -35,6 +35,7 @@ val fold_list : ('acc -> 'a -> 'acc) -> 'acc -> 'a list -> 'acc
 val seq : 'a t -> 'a seq
 val rseq : 'a t -> 'a seq
 val seq_to_list : 'a seq -> 'a list
+val to_seq : 'a seq -> 'a Seq.t
 val seq_reverse : 'a seq -> 'a seq
 val fold_seq : ('acc -> 'a -> 'acc) -> 'acc -> 'a seq -> 'acc
 val slice : ?from_:'a -> ?to_:'a -> ?cmp:'a comparator -> 'a t -> 'a list

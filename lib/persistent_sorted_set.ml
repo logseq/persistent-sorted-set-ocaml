@@ -51,6 +51,11 @@ type direction =
 
 type 'a seq_source =
   | Seq_values of 'a list
+  | Seq_tree of 'a tree
+  | Seq_edited of
+      { storage : 'a storage
+      ; tree : 'a edited_tree
+      }
   | Seq_deferred of
       { storage : 'a storage
       ; address : string
@@ -892,6 +897,17 @@ let slice_values cmp from_ to_ values =
   values
   |> List.filter (fun value -> lower_ok cmp from_ value && upper_ok cmp to_ value)
 
+let rec list_seq_slice cmp from_ to_ values () =
+  match values with
+  | [] -> Seq.Nil
+  | value :: rest ->
+    if not (lower_ok cmp from_ value) then
+      list_seq_slice cmp from_ to_ rest ()
+    else if not (upper_ok cmp to_ value) then
+      Seq.Nil
+    else
+      Seq.Cons (value, list_seq_slice cmp from_ to_ rest)
+
 let reverse_slice_values cmp from_ to_ values =
   values
   |> List.rev
@@ -901,6 +917,24 @@ let reverse_slice_values cmp from_ to_ values =
     | Some from_, None -> cmp value from_ <= 0
     | None, Some to_ -> cmp value to_ >= 0
     | Some from_, Some to_ -> cmp value from_ <= 0 && cmp value to_ >= 0)
+
+let rec list_seq_reverse_slice cmp from_ to_ values () =
+  match values with
+  | [] -> Seq.Nil
+  | value :: rest ->
+    let in_range =
+      match from_, to_ with
+      | None, None -> true
+      | Some from_, None -> cmp value from_ <= 0
+      | None, Some to_ -> cmp value to_ >= 0
+      | Some from_, Some to_ -> cmp value from_ <= 0 && cmp value to_ >= 0
+    in
+    if in_range then
+      Seq.Cons (value, list_seq_reverse_slice cmp from_ to_ rest)
+    else
+      match from_ with
+      | Some lower when cmp value lower > 0 -> list_seq_reverse_slice cmp from_ to_ rest ()
+      | _ -> Seq.Nil
 
 let rec slice_deferred storage cmp from_ to_ address =
   storage.accessed address;
@@ -969,6 +1003,18 @@ let slice_array_into cmp from_ to_ values acc =
   in
   loop acc 0
 
+let rec slice_array_seq cmp from_ to_ values index () =
+  if index >= Array.length values then
+    Seq.Nil
+  else
+    let value = values.(index) in
+    if not (lower_ok cmp from_ value) then
+      slice_array_seq cmp from_ to_ values (index + 1) ()
+    else if not (upper_ok cmp to_ value) then
+      Seq.Nil
+    else
+      Seq.Cons (value, slice_array_seq cmp from_ to_ values (index + 1))
+
 let reverse_slice_array_into cmp from_ to_ values acc =
   let rec loop acc index =
     if index < 0 then acc
@@ -989,6 +1035,25 @@ let reverse_slice_array_into cmp from_ to_ values acc =
   in
   loop acc (Array.length values - 1)
 
+let rec reverse_slice_array_seq cmp from_ to_ values index () =
+  if index < 0 then
+    Seq.Nil
+  else
+    let value = values.(index) in
+    let in_range =
+      match from_, to_ with
+      | None, None -> true
+      | Some from_, None -> cmp value from_ <= 0
+      | None, Some to_ -> cmp value to_ >= 0
+      | Some from_, Some to_ -> cmp value from_ <= 0 && cmp value to_ >= 0
+    in
+    if in_range then
+      Seq.Cons (value, reverse_slice_array_seq cmp from_ to_ values (index - 1))
+    else
+      match from_ with
+      | Some lower when cmp value lower > 0 -> reverse_slice_array_seq cmp from_ to_ values (index - 1) ()
+      | _ -> Seq.Nil
+
 let rec slice_tree_into cmp from_ to_ tree acc =
   match tree with
   | Tree_leaf values -> slice_array_into cmp from_ to_ values acc
@@ -1007,6 +1072,27 @@ let rec slice_tree_into cmp from_ to_ tree acc =
 
 let slice_tree cmp from_ to_ tree =
   List.rev (slice_tree_into cmp from_ to_ tree [])
+
+let rec slice_tree_seq cmp from_ to_ tree =
+  match tree with
+  | Tree_leaf values -> slice_array_seq cmp from_ to_ values 0
+  | Tree_branch (keys, children) ->
+    let rec collect previous_key index () =
+      if index >= Array.length children then
+        Seq.Nil
+      else
+        let key = keys.(index) in
+        if child_after_range cmp to_ previous_key then
+          Seq.Nil
+        else if child_before_range cmp from_ key then
+          collect (Some key) (index + 1) ()
+        else
+          Seq.append
+            (slice_tree_seq cmp from_ to_ children.(index))
+            (collect (Some key) (index + 1))
+            ()
+    in
+    collect None 0
 
 let rec reverse_slice_tree_into cmp from_ to_ tree acc =
   match tree with
@@ -1038,6 +1124,38 @@ let rec reverse_slice_tree_into cmp from_ to_ tree acc =
 let reverse_slice_tree cmp from_ to_ tree =
   List.rev (reverse_slice_tree_into cmp from_ to_ tree [])
 
+let rec reverse_slice_tree_seq cmp from_ to_ tree =
+  match tree with
+  | Tree_leaf values -> reverse_slice_array_seq cmp from_ to_ values (Array.length values - 1)
+  | Tree_branch (keys, children) ->
+    let rec collect index () =
+      if index < 0 then
+        Seq.Nil
+      else
+        let key = keys.(index) in
+        let previous_key = if index = 0 then None else Some keys.(index - 1) in
+        let child_above_range =
+          match from_, previous_key with
+          | Some from_, Some previous_key -> cmp previous_key from_ > 0
+          | _ -> false
+        in
+        let child_below_range =
+          match to_ with
+          | Some to_ -> cmp key to_ < 0
+          | None -> false
+        in
+        if child_above_range then
+          collect (index - 1) ()
+        else if child_below_range then
+          Seq.Nil
+        else
+          Seq.append
+            (reverse_slice_tree_seq cmp from_ to_ children.(index))
+            (collect (index - 1))
+            ()
+    in
+    collect (Array.length children - 1)
+
 let slice ?from_ ?to_ ?cmp (set : 'a t) =
   let cmp = Option.value ~default:set.cmp cmp in
   match set.data with
@@ -1057,9 +1175,9 @@ let rslice ?from_ ?to_ ?cmp (set : 'a t) =
 let seq_source_of_set set =
   match set.data with
   | Empty -> Seq_values []
-  | Tree tree -> Seq_values (materialize_tree tree)
+  | Tree tree -> Seq_tree tree
   | Deferred { storage; address } -> Seq_deferred { storage; address }
-  | Edited _ -> Seq_values (materialize set)
+  | Edited { storage; tree } -> Seq_edited { storage; tree }
 
 let seq (set : 'a t) =
   { set_cmp = set.cmp
@@ -1081,10 +1199,31 @@ let seq_to_list seq =
   match seq.source, seq.direction with
   | Seq_values values, Asc -> slice_values seq.set_cmp seq.lower seq.upper values
   | Seq_values values, Desc -> reverse_slice_values seq.set_cmp seq.upper seq.lower values
+  | Seq_tree tree, Asc -> slice_tree seq.set_cmp seq.lower seq.upper tree
+  | Seq_tree tree, Desc -> reverse_slice_tree seq.set_cmp seq.upper seq.lower tree
+  | Seq_edited { storage; tree }, Asc ->
+    slice_values seq.set_cmp seq.lower seq.upper (materialize_edited_tree storage tree)
+  | Seq_edited { storage; tree }, Desc ->
+    reverse_slice_values seq.set_cmp seq.upper seq.lower (materialize_edited_tree storage tree)
   | Seq_deferred { storage; address }, Asc ->
     slice_deferred storage seq.set_cmp seq.lower seq.upper address
   | Seq_deferred { storage; address }, Desc ->
     reverse_slice_deferred storage seq.set_cmp seq.upper seq.lower address
+
+let to_seq seq =
+  match seq.source, seq.direction with
+  | Seq_values values, Asc -> list_seq_slice seq.set_cmp seq.lower seq.upper values
+  | Seq_values values, Desc -> list_seq_reverse_slice seq.set_cmp seq.upper seq.lower (List.rev values)
+  | Seq_tree tree, Asc -> slice_tree_seq seq.set_cmp seq.lower seq.upper tree
+  | Seq_tree tree, Desc -> reverse_slice_tree_seq seq.set_cmp seq.upper seq.lower tree
+  | Seq_edited { storage; tree }, Asc ->
+    list_seq_slice seq.set_cmp seq.lower seq.upper (materialize_edited_tree storage tree)
+  | Seq_edited { storage; tree }, Desc ->
+    list_seq_reverse_slice seq.set_cmp seq.upper seq.lower (List.rev (materialize_edited_tree storage tree))
+  | Seq_deferred { storage; address }, Asc ->
+    list_seq_slice seq.set_cmp seq.lower seq.upper (materialize_address storage address)
+  | Seq_deferred { storage; address }, Desc ->
+    list_seq_reverse_slice seq.set_cmp seq.upper seq.lower (List.rev (materialize_address storage address))
 
 let seq_reverse seq =
   let direction =
@@ -1094,7 +1233,7 @@ let seq_reverse seq =
   in
   { seq with direction }
 
-let fold_seq f init seq = List.fold_left f init (seq_to_list seq)
+let fold_seq f init seq = Seq.fold_left f init (to_seq seq)
 
 let slice_seq ?from_ ?to_ ?cmp set =
   let set_cmp = Option.value ~default:set.cmp cmp |> normalize_cmp in

@@ -1449,6 +1449,23 @@ let test_restored_nested_add_reuses_unchanged_branch_addresses_lazily () =
    | None -> failwith "restored nested add root should be stored");
   assert_equal_list "restored nested add keeps sorted values" (irange 0 1055) (to_list added_stored)
 
+let test_tree_slice_to_seq_seeks_lazily () =
+  let comparisons = ref 0 in
+  let cmp left right =
+    incr comparisons;
+    compare left right
+  in
+  let set = of_list_by cmp (irange 0 10_000) in
+  comparisons := 0;
+  let seq = slice_seq ~from_:5_000 ~to_:9_000 set |> to_seq in
+  (match Seq.uncons seq with
+   | Some (first, _) -> assert_equal_int "tree slice sequence starts at lower bound" 5_000 first
+   | None -> failwith "tree slice sequence should return a first value");
+  if !comparisons > 1_000 then
+    failf
+      "tree slice sequence should seek through branch bounds instead of scanning the prefix: %d comparisons"
+      !comparisons
+
 let () =
   test_settings_control_storage_branching_factor ();
   test_restore_preserves_settings_for_later_edits ();
@@ -1488,4 +1505,5 @@ let () =
   test_restored_walk_addresses_visits_stored_descendants ();
   test_nested_storage_remove_reuses_unchanged_branch_addresses ();
   test_restored_nested_remove_reuses_unchanged_branch_addresses_lazily ();
-  test_restored_nested_add_reuses_unchanged_branch_addresses_lazily ()
+  test_restored_nested_add_reuses_unchanged_branch_addresses_lazily ();
+  test_tree_slice_to_seq_seeks_lazily ()
