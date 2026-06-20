@@ -44,6 +44,10 @@ let assert_equal_string_list label expected actual =
       (String.concat "; " expected)
       (String.concat "; " actual)
 
+let assert_equal_string label expected actual =
+  if expected <> actual then
+    failf "%s: expected\n%s\ngot\n%s" label expected actual
+
 let assert_equal_int label expected actual =
   if expected <> actual then
     failf "%s: expected %d, got %d" label expected actual
@@ -150,6 +154,11 @@ let roundtrip_set set =
   | Some restored -> restored
   | None -> failwith "roundtrip_set should restore the stored root"
 
+let root_node_exn label set =
+  match root_node set with
+  | Some root -> root
+  | None -> failf "%s: expected an in-memory root node" label
+
 let compare_pair_with_nil_wildcard (x0, x1) (y0, y1) =
   let compare_part left right =
     match (left, right) with
@@ -181,6 +190,59 @@ let bucket_range divisor ~from_ ~to_ values =
       let bucket = value / divisor in
       bucket >= from_ / divisor && bucket <= to_ / divisor)
     values
+
+let test_show_node_tree_string () =
+  let one_leaf =
+    root_node_exn "one-leaf show_node"
+      (of_list_by ~settings:{ branching_factor = 3 } ~cmp:compare [ 3; 1; 2 ])
+  in
+  assert_equal_string "show_node renders leaf values"
+    "Leaf(address=none len=3 values=[1; 2; 3])"
+    (show_node string_of_int one_leaf);
+  let branch_root =
+    root_node_exn "branch show_node"
+      (of_list_by ~settings:{ branching_factor = 3 } ~cmp:compare
+         [ 7; 6; 5; 4; 3; 2; 1; 0 ])
+  in
+  assert_equal_string "show_node renders branch children"
+    "Branch(address=none keys=[2; 5; 7])\n\
+    \  Leaf(address=none len=3 values=[0; 1; 2])\n\
+    \  Leaf(address=none len=3 values=[3; 4; 5])\n\
+    \  Leaf(address=none len=2 values=[6; 7])"
+    (show_node string_of_int branch_root);
+  (match root_node (empty ()) with
+  | None -> ()
+  | Some _ -> failwith "empty set should not expose a root node");
+  let memory = Hashtbl.create 8 in
+  let writes = ref 0 in
+  let storage =
+    {
+      store_node =
+        (fun node ->
+          incr writes;
+          let address = "node-" ^ string_of_int !writes in
+          Hashtbl.replace memory address node;
+          address);
+      restore_node = (fun address -> Hashtbl.find_opt memory address);
+      accessed = (fun _ -> ());
+    }
+  in
+  let _, stored =
+    store
+      (of_list_by ~storage ~settings:{ branching_factor = 4 } ~cmp:compare
+         (irange 0 9))
+  in
+  (match root_node stored with
+  | None -> ()
+  | Some _ -> failwith "deferred stored set should not expose a root node");
+  let edited_root = root_node_exn "edited stored show_node" (add 10 stored) in
+  assert_equal_string
+    "show_node renders storage refs without materializing them"
+    "Branch(address=none keys=[3; 7; 10])\n\
+    \  Ref(address=node-1 max_key=3 cached=none)\n\
+    \  Ref(address=node-2 max_key=7 cached=none)\n\
+    \  Leaf(address=none len=3 values=[8; 9; 10])"
+    (show_node string_of_int edited_root)
 
 let test_storage_backed_pure_trees_do_not_rescan_before_edits () =
   let build_storage () =
@@ -2076,6 +2138,7 @@ let test_tree_slice_to_seq_seeks_lazily () =
       !comparisons
 
 let () =
+  test_show_node_tree_string ();
   test_storage_backed_pure_trees_do_not_rescan_before_edits ();
   test_of_list_by_bulk_builds_without_chained_updates ();
   test_to_list_materializes_tree_linearly ();

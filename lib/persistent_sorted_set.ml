@@ -156,6 +156,46 @@ let materialize set =
   | Deferred { address } ->
       materialize_address (storage_required set.set_storage) address
 
+let root_node set =
+  match set.data with
+  | Tree { root; _ } -> Some root
+  | Empty | Deferred _ -> None
+
+let show_option_address = function None -> "none" | Some address -> address
+
+let show_list show_value values =
+  "[" ^ String.concat "; " (List.map show_value values) ^ "]"
+
+let show_array show_value values = show_list show_value (Array.to_list values)
+
+let show_node show_value root =
+  let lines = ref [] in
+  let add_line depth line =
+    lines := (String.make (depth * 2) ' ' ^ line) :: !lines
+  in
+  let rec loop depth = function
+    | Node.Ref { max_key; address; cached } ->
+        add_line depth
+          (Printf.sprintf "Ref(address=%s max_key=%s cached=%s)" address
+             (show_value max_key)
+             (match cached with None -> "none" | Some _ -> "some"));
+        Option.iter (loop (depth + 1)) cached
+    | Node.Leaf { values; len; address } ->
+        add_line depth
+          (Printf.sprintf "Leaf(address=%s len=%d values=%s)"
+             (show_option_address address)
+             len
+             (show_list show_value (array_prefix_to_list values len)))
+    | Node.Branch { keys; children; address } ->
+        add_line depth
+          (Printf.sprintf "Branch(address=%s keys=%s)"
+             (show_option_address address)
+             (show_array show_value keys));
+        Array.iter (loop (depth + 1)) children
+  in
+  loop 0 root;
+  String.concat "\n" (List.rev !lines)
+
 let rec last = function
   | [] -> None
   | [ value ] -> Some value

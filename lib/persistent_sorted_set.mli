@@ -9,6 +9,7 @@ type 'a storage = {
 }
 
 type 'a t
+type 'a node
 type 'a seq
 
 val default_settings : settings
@@ -42,7 +43,6 @@ val of_sorted_array_by :
 
 val add : 'a -> 'a t -> 'a t
 val remove : 'a -> 'a t -> 'a t
-val validate_invariants : 'a t -> unit
 val mem : 'a -> 'a t -> bool
 val count : 'a t -> int
 val to_list : 'a t -> 'a list
@@ -67,3 +67,8 @@ val restore :
   'a storage ->
   string ->
   'a t option
+
+(* DEBUG vals *)
+val validate_invariants : 'a t -> unit
+val root_node : 'a t -> 'a node option
+val show_node : ('a -> string) -> 'a node -> string
