@@ -88,12 +88,11 @@ let check ref_type label =
   !restored_slots
 
 let () =
-  let soft_slots = check Soft "soft" in
   let weak_slots = check Weak "weak" in
   set_timeout
     (fun () ->
       force_full_collection ();
-      if List.exists (fun slot -> Weak.check slot 0) (soft_slots @ weak_slots)
-      then failf "soft/weak ref-types should release restored nodes after JS GC"
+      if List.exists (fun slot -> Weak.check slot 0) weak_slots then
+        failf "weak ref-type should release restored nodes after JS GC"
       else set_result "pass")
     0

@@ -96,7 +96,7 @@ OCaml uses several representations:
 
 OCaml supports configurable `branching_factor` and `ref_type`, validated at
 construction and restore time. The default branching factor is 32 and the
-default ref type is `Soft`.
+default ref type is `Weak`.
 
 ## Public API Differences
 
@@ -321,14 +321,12 @@ In the inspected ClojureScript file, `max-len` is fixed at 32.
 OCaml exposes:
 
 ```ocaml
-type ref_type = Strong | Soft | Weak
+type ref_type = Strong | Weak
 type settings = { branching_factor : int; ref_type : ref_type }
 ```
 
 and allows any branching factor >= 2. `Strong` keeps restored nodes cached in
-memory. `Soft` and `Weak` allow restored nodes to be released and fetched again;
-`Soft` is intentionally implemented with the same reclaimable behavior as
-`Weak`, because OCaml does not expose JVM soft-reference pressure heuristics.
+memory. `Weak` allows restored nodes to be released and fetched again.
 
 ## Test Coverage Differences
 

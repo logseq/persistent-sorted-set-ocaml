@@ -478,6 +478,8 @@ let test_settings_control_storage_branching_factor () =
   | None -> failwith "custom root should be stored");
   if settings (empty ()) <> default_settings then
     failwith "empty should use default settings";
+  if default_settings.ref_type <> Weak then
+    failwith "default settings should use weak refs";
   let default_root, _ = store (of_list_by ~storage ~cmp:compare (irange 0 9)) in
   match Hashtbl.find_opt memory default_root with
   | Some (Leaf values) ->
@@ -663,7 +665,6 @@ let test_reclaimable_ref_types_release_restored_nodes_after_gc () =
     if List.exists (fun slot -> Weak.check slot 0) !restored_slots then
       failf "%s ref-type should release restored nodes after GC" label
   in
-  check Soft "soft";
   check Weak "weak"
 
 let test_settings_validate_branching_factor () =

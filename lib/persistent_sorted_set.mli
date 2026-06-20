@@ -1,5 +1,5 @@
 type 'a comparator = 'a -> 'a -> int
-type ref_type = Strong | Soft | Weak
+type ref_type = Strong | Weak
 type settings = { branching_factor : int; ref_type : ref_type }
 type 'a stored_node = Leaf of 'a list | Branch of 'a list * string list
 

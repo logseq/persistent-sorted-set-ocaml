@@ -1,5 +1,5 @@
 type 'a comparator = 'a -> 'a -> int
-type ref_type = Strong | Soft | Weak
+type ref_type = Strong | Weak
 type settings = { branching_factor : int; ref_type : ref_type }
 type 'a stored_node = Leaf of 'a list | Branch of 'a list * string list
 
@@ -50,7 +50,7 @@ let normalize_cmp cmp left right =
   match cmp left right with n when n < 0 -> -1 | 0 -> 0 | _ -> 1
 
 let default_cmp left right = Stdlib.compare left right
-let default_settings = { branching_factor = 32; ref_type = Soft }
+let default_settings = { branching_factor = 32; ref_type = Weak }
 
 let validate_settings settings =
   if settings.branching_factor < 2 then
@@ -86,7 +86,7 @@ let cache_storage settings storage =
                 | None -> None));
         accessed = storage.accessed;
       }
-  | Soft | Weak ->
+  | Weak ->
       let cache = Hashtbl.create 128 in
       {
         store_node =
