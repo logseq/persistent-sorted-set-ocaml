@@ -253,8 +253,8 @@ let test_show_node_tree_string () =
   assert_equal_string
     "show_node renders storage refs without materializing them"
     "Branch(address=none keys=[3; 7; 10])\n\
-    \  Ref(address=node-1 max_key=3 cached=none)\n\
-    \  Ref(address=node-2 max_key=7 cached=none)\n\
+    \  Ref(address=node-1 max_key=3)\n\
+    \  Ref(address=node-2 max_key=7)\n\
     \  Leaf(address=none len=3 values=[8; 9; 10])"
     (show_node string_of_int edited_root)
 
@@ -1703,19 +1703,21 @@ let test_restored_mem_reads_only_needed_leaves () =
   if not (mem 40 restored) then
     failwith "mem should find values after skipping earlier leaves";
   assert_equal_int
-    "restored mem should reuse the cached root and read only the matching \
-     later leaf"
+    "restored mem should reuse the storage-cached root and read only the \
+     matching later leaf"
     1 !reads;
   assert_equal_list
-    "restored mem should access only root and matching later leaf"
-    [ "node-2"; root ] !accessed;
+    "restored mem should only mark the cache-missed later leaf accessed"
+    [ "node-2" ] !accessed;
   reads := 0;
   accessed := [];
   if mem (-1) restored then
     failwith "mem should reject values below the first leaf";
-  assert_equal_int "restored mem lower miss should reuse cached nodes" 0 !reads;
-  assert_equal_list "restored mem lower miss should access root and first leaf"
-    [ "node-1"; root ] !accessed
+  assert_equal_int "restored mem lower miss should reuse storage-cached nodes" 0
+    !reads;
+  assert_equal_list
+    "restored mem lower miss should not mark storage-cached nodes accessed" []
+    !accessed
 
 let test_restored_tree_refs_cache_repeated_access () =
   let memory = Hashtbl.create 16 in
@@ -1746,16 +1748,19 @@ let test_restored_tree_refs_cache_repeated_access () =
   let appended = add 101 restored in
   reads := 0;
   accessed := [];
-  if not (mem 5 appended) then failwith "mem should find cached ref values";
+  if not (mem 5 appended) then
+    failwith "mem should find storage-cached ref values";
   assert_equal_int "first ref mem restores the unchanged leaf once" 1 !reads;
   assert_equal_list "first ref mem accesses the unchanged leaf" [ "node-1" ]
     !accessed;
   reads := 0;
   accessed := [];
   if not (mem 5 appended) then
-    failwith "mem should find values from cached refs";
-  assert_equal_int "second ref mem should reuse the cached leaf" 0 !reads;
-  assert_equal_list "second ref mem should not access storage" [] !accessed
+    failwith "mem should find values from storage-cached refs";
+  assert_equal_int "second ref mem should reuse the storage-cached leaf" 0
+    !reads;
+  assert_equal_list "second ref mem should not mark cached storage accessed" []
+    !accessed
 
 let test_restored_mem_uses_binary_search_inside_stored_nodes () =
   let memory = Hashtbl.create 128 in
@@ -1834,12 +1839,13 @@ let test_restored_slice_reads_only_overlapping_leaves () =
     (irange 62 65)
     (slice ~from_:62 ~to_:65 restored);
   assert_equal_int
-    "restored slice across boundary should reuse cached root and first leaf" 1
-    !reads;
+    "restored slice across boundary should reuse storage-cached root and first \
+     leaf"
+    1 !reads;
   assert_equal_list
-    "restored slice across boundary should access root and two leaves"
-    [ "node-3"; "node-2"; root ]
-    !accessed
+    "restored slice across boundary should only mark the cache-missed leaf \
+     accessed"
+    [ "node-3" ] !accessed
 
 let test_restored_reverse_slice_reads_only_overlapping_leaves () =
   let memory = Hashtbl.create 16 in
@@ -1883,13 +1889,13 @@ let test_restored_reverse_slice_reads_only_overlapping_leaves () =
     (irange 65 62)
     (rslice ~from_:65 ~to_:62 restored);
   assert_equal_int
-    "restored reverse slice across boundary should reuse cached root and first \
-     leaf"
+    "restored reverse slice across boundary should reuse storage-cached root \
+     and first leaf"
     1 !reads;
   assert_equal_list
-    "restored reverse slice across boundary should access root and two leaves"
-    [ "node-2"; "node-3"; root ]
-    !accessed
+    "restored reverse slice across boundary should only mark the cache-missed \
+     leaf accessed"
+    [ "node-3" ] !accessed
 
 let test_restored_reverse_slice_avoids_branch_annotation_list () =
   let memory = Hashtbl.create 4097 in
