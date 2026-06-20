@@ -34,6 +34,24 @@ jobs:
         with:
           node-version: "22"
 
+      - name: Set up browser for JS memory tests
+        run: |
+          browser=""
+          for candidate in google-chrome google-chrome-stable chromium chromium-browser; do
+            if command -v "$candidate" >/dev/null 2>&1; then
+              browser="$(command -v "$candidate")"
+              break
+            fi
+          done
+
+          if [ -z "$browser" ]; then
+            echo "Chrome/Chromium is required for browser memory tests" >&2
+            exit 1
+          fi
+
+          echo "CHROME_BIN=$browser" >> "$GITHUB_ENV"
+          "$browser" --version
+
       - name: Install OCaml dependencies
         run: opam install . --deps-only --with-test -y
 
@@ -48,6 +66,9 @@ jobs:
           UPSTREAM_TEST_DIR: ${{ github.workspace }}/_ci/persistent-sorted-set/test-clojure/me/tonsky/persistent_sorted_set/test
           UPSTREAM_TEST_DIFF_STRICT: "1"
         run: bash script/diff_upstream_tests.sh
+
+      - name: Check browser memory test CI wiring
+        run: bash script/check_ci_browser_memory_test.sh
 
       - name: Run tests
         run: opam exec -- dune runtest

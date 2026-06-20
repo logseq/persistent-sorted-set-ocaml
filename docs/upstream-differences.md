@@ -94,8 +94,9 @@ OCaml uses several representations:
   - `Leaf of 'a list`
   - `Branch of 'a list * string list`
 
-OCaml supports configurable `branching_factor`, validated at construction and
-restore time. The default is 32.
+OCaml supports configurable `branching_factor` and `ref_type`, validated at
+construction and restore time. The default branching factor is 32 and the
+default ref type is `Soft`.
 
 ## Public API Differences
 
@@ -317,14 +318,17 @@ Upstream ClojureScript reports:
 
 In the inspected ClojureScript file, `max-len` is fixed at 32.
 
-OCaml exposes only:
+OCaml exposes:
 
 ```ocaml
-type settings = { branching_factor : int }
+type ref_type = Strong | Soft | Weak
+type settings = { branching_factor : int; ref_type : ref_type }
 ```
 
-and allows any value >= 2. Local tests cover custom branching factors. This is an
-OCaml extension relative to the ClojureScript implementation.
+and allows any branching factor >= 2. `Strong` keeps restored nodes cached in
+memory. `Soft` and `Weak` allow restored nodes to be released and fetched again;
+`Soft` is intentionally implemented with the same reclaimable behavior as
+`Weak`, because OCaml does not expose JVM soft-reference pressure heuristics.
 
 ## Test Coverage Differences
 

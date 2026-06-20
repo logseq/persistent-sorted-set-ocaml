@@ -52,6 +52,16 @@ let assert_equal_int label expected actual =
   if expected <> actual then
     failf "%s: expected %d, got %d" label expected actual
 
+let copy_stored_node = function
+  | Leaf values -> Leaf values
+  | Branch (keys, child_addresses) -> Branch (keys, child_addresses)
+
+let force_full_collection () =
+  for _ = 1 to 5 do
+    Gc.full_major ();
+    Gc.compact ()
+  done
+
 let stored_addresses memory root =
   let rec loop address =
     match Hashtbl.find_opt memory address with
@@ -194,14 +204,14 @@ let bucket_range divisor ~from_ ~to_ values =
 let test_show_node_tree_string () =
   let one_leaf =
     root_node_exn "one-leaf show_node"
-      (of_list_by ~settings:{ branching_factor = 3 } ~cmp:compare [ 3; 1; 2 ])
+      (of_list_by ~settings:{ default_settings with branching_factor = 3 } ~cmp:compare [ 3; 1; 2 ])
   in
   assert_equal_string "show_node renders leaf values"
     "Leaf(address=none len=3 values=[1; 2; 3])"
     (show_node string_of_int one_leaf);
   let branch_root =
     root_node_exn "branch show_node"
-      (of_list_by ~settings:{ branching_factor = 3 } ~cmp:compare
+      (of_list_by ~settings:{ default_settings with branching_factor = 3 } ~cmp:compare
          [ 7; 6; 5; 4; 3; 2; 1; 0 ])
   in
   assert_equal_string "show_node renders branch children"
@@ -229,7 +239,7 @@ let test_show_node_tree_string () =
   in
   let _, stored =
     store
-      (of_list_by ~storage ~settings:{ branching_factor = 4 } ~cmp:compare
+      (of_list_by ~storage ~settings:{ default_settings with branching_factor = 4 } ~cmp:compare
          (irange 0 9))
   in
   (match root_node stored with
@@ -316,7 +326,7 @@ let test_of_list_by_bulk_builds_without_chained_updates () =
 
 let test_to_list_materializes_tree_linearly () =
   let set =
-    of_sorted_array_by ~settings:{ branching_factor = 2 } ~cmp:compare
+    of_sorted_array_by ~settings:{ default_settings with branching_factor = 2 } ~cmp:compare
       (Array.init 50_000 Fun.id)
   in
   let fold_time =
@@ -344,7 +354,7 @@ let test_settings_control_storage_branching_factor () =
       accessed = (fun _ -> ());
     }
   in
-  let custom_settings = { branching_factor = 4 } in
+  let custom_settings = { default_settings with branching_factor = 4 } in
   let set =
     of_list_by ~storage ~settings:custom_settings ~cmp:compare (irange 0 9)
   in
@@ -396,7 +406,7 @@ let test_restore_preserves_settings_for_later_edits () =
       accessed = (fun address -> accessed := address :: !accessed);
     }
   in
-  let custom_settings = { branching_factor = 4 } in
+  let custom_settings = { default_settings with branching_factor = 4 } in
   let root, _ =
     store
       (of_list_by ~storage ~settings:custom_settings ~cmp:compare (irange 0 15))
@@ -447,14 +457,116 @@ let test_restore_preserves_settings_for_later_edits () =
   | Some _ -> failwith "custom restored add root should be a branch"
   | None -> failwith "custom restored add root should be stored"
 
+let test_ref_type_controls_restored_node_cache () =
+  let memory = Hashtbl.create 16 in
+  let writes = ref 0 in
+  let reads = ref 0 in
+  let storage =
+    {
+      store_node =
+        (fun node ->
+          incr writes;
+          let address = "node-" ^ string_of_int !writes in
+          Hashtbl.replace memory address (Marshal.to_string node []);
+          address);
+      restore_node =
+        (fun address ->
+          incr reads;
+          Option.map
+            (fun bytes -> Marshal.from_string bytes 0)
+            (Hashtbl.find_opt memory address));
+      accessed = (fun _ -> ());
+    }
+  in
+  let strong_settings = { branching_factor = 4; ref_type = Strong } in
+  let weak_settings = { branching_factor = 4; ref_type = Weak } in
+  let root, _ =
+    store (of_list_by ~storage ~settings:strong_settings ~cmp:compare (irange 0 15))
+  in
+  reads := 0;
+  let strong =
+    match restore ~cmp:compare ~settings:strong_settings storage root with
+    | Some restored -> restored
+    | None -> failwith "strong restore should find the stored root"
+  in
+  if not (mem 15 strong) then failwith "strong restored set should contain stored value";
+  let strong_first_reads = !reads in
+  if not (mem 15 strong) then failwith "strong restored set should contain stored value again";
+  assert_equal_int
+    "strong ref-type should keep restored nodes cached"
+    strong_first_reads
+    !reads;
+  reads := 0;
+  let weak =
+    match restore ~cmp:compare ~settings:weak_settings storage root with
+    | Some restored -> restored
+    | None -> failwith "weak restore should find the stored root"
+  in
+  if not (mem 15 weak) then failwith "weak restored set should contain stored value";
+  let weak_first_reads = !reads in
+  if not (mem 15 weak) then failwith "weak restored set should contain stored value again";
+  assert_equal_int
+    "weak ref-type should reuse restored nodes before collection"
+    weak_first_reads
+    !reads;
+  Gc.full_major ();
+  Gc.compact ();
+  if not (mem 15 weak) then failwith "weak restored set should contain stored value after collection";
+  if !reads <= weak_first_reads then
+    failwith "weak ref-type should allow restored nodes to be released and fetched again"
+
+let test_reclaimable_ref_types_release_restored_nodes_after_gc () =
+  let check ref_type label =
+    let memory = Hashtbl.create 16 in
+    let writes = ref 0 in
+    let restored_slots = ref [] in
+    let storage =
+      {
+        store_node =
+          (fun node ->
+            incr writes;
+            let address = "node-" ^ string_of_int !writes in
+            Hashtbl.replace memory address node;
+            address);
+        restore_node =
+          (fun address ->
+            match Hashtbl.find_opt memory address with
+            | None -> None
+            | Some stored ->
+                let node = copy_stored_node stored in
+                let slot = Weak.create 1 in
+                Weak.set slot 0 (Some node);
+                restored_slots := slot :: !restored_slots;
+                Some node);
+        accessed = (fun _ -> ());
+      }
+    in
+    let settings = { branching_factor = 4; ref_type } in
+    let root, _ = store (of_list_by ~storage ~settings ~cmp:compare (irange 0 15)) in
+    let restored =
+      match restore ~cmp:compare ~settings storage root with
+      | Some restored -> restored
+      | None -> failf "%s restore should find the stored root" label
+    in
+    if not (mem 15 restored) then
+      failf "%s restored set should contain stored value" label;
+    if !restored_slots = [] then
+      failf "%s test should observe restored nodes" label;
+    force_full_collection ();
+    if List.exists (fun slot -> Weak.check slot 0) !restored_slots then
+      failf "%s ref-type should release restored nodes after GC" label
+  in
+  check Soft "soft";
+  check Weak "weak"
+
 let test_settings_validate_branching_factor () =
   assert_raises_invalid_arg "empty_by rejects branching factors below two"
     (fun () ->
-      ignore (empty_by ~settings:{ branching_factor = 1 } ~cmp:compare ()));
+      ignore (empty_by ~settings:{ default_settings with branching_factor = 1 } ~cmp:compare ()));
   assert_raises_invalid_arg "of_list_by rejects non-positive branching factors"
     (fun () ->
       ignore
-        (of_list_by ~settings:{ branching_factor = 0 } ~cmp:compare [ 1; 2; 3 ]));
+        (of_list_by ~settings:{ default_settings with branching_factor = 0 } ~cmp:compare [ 1; 2; 3 ]));
   let memory = Hashtbl.create 1 in
   let storage =
     {
@@ -469,7 +581,7 @@ let test_settings_validate_branching_factor () =
   assert_raises_invalid_arg "restore rejects invalid branching factors"
     (fun () ->
       ignore
-        (restore ~cmp:compare ~settings:{ branching_factor = 1 } storage "root"))
+        (restore ~cmp:compare ~settings:{ default_settings with branching_factor = 1 } storage "root"))
 
 let test_of_sorted_array_uses_sorted_input_and_settings () =
   let memory = Hashtbl.create 16 in
@@ -486,7 +598,7 @@ let test_of_sorted_array_uses_sorted_input_and_settings () =
       accessed = (fun _ -> ());
     }
   in
-  let custom_settings = { branching_factor = 3 } in
+  let custom_settings = { default_settings with branching_factor = 3 } in
   let set =
     of_sorted_array_by ~storage ~settings:custom_settings ~cmp:compare
       [| 0; 1; 1; 2; 3; 3; 4; 5; 6 |]
@@ -1162,7 +1274,7 @@ let test_storage_remove_borrows_from_right_sibling () =
       accessed = (fun _ -> ());
     }
   in
-  let settings = { branching_factor = 4 } in
+  let settings = { default_settings with branching_factor = 4 } in
   let _, stored =
     store (of_list_by ~storage ~settings ~cmp:compare (irange 0 7))
   in
@@ -1200,7 +1312,7 @@ let test_nested_storage_remove_borrows_branch_from_right_sibling () =
       accessed = (fun _ -> ());
     }
   in
-  let settings = { branching_factor = 4 } in
+  let settings = { default_settings with branching_factor = 4 } in
   let _, stored =
     store (of_list_by ~storage ~settings ~cmp:compare (irange 0 63))
   in
@@ -1460,7 +1572,7 @@ let test_restored_mem_reads_only_needed_leaves () =
   if not (mem 40 restored) then
     failwith "mem should find values after skipping earlier leaves";
   assert_equal_int
-    "restored mem should use branch keys to skip irrelevant leaves" 2 !reads;
+    "restored mem should reuse the cached root and read only the matching later leaf" 1 !reads;
   assert_equal_list
     "restored mem should access only root and matching later leaf"
     [ "node-2"; root ] !accessed;
@@ -1468,8 +1580,7 @@ let test_restored_mem_reads_only_needed_leaves () =
   accessed := [];
   if mem (-1) restored then
     failwith "mem should reject values below the first leaf";
-  assert_equal_int "restored mem should stop after first leaf for lower misses"
-    2 !reads;
+  assert_equal_int "restored mem lower miss should reuse cached nodes" 0 !reads;
   assert_equal_list "restored mem lower miss should access root and first leaf"
     [ "node-1"; root ] !accessed
 
@@ -1533,7 +1644,7 @@ let test_restored_mem_uses_binary_search_inside_stored_nodes () =
       accessed = (fun _ -> ());
     }
   in
-  let settings = { branching_factor = 64 } in
+  let settings = { default_settings with branching_factor = 64 } in
   let root, _ =
     store (of_sorted_array_by ~storage ~settings ~cmp (Array.init 4_096 Fun.id))
   in
@@ -1590,7 +1701,7 @@ let test_restored_slice_reads_only_overlapping_leaves () =
     (irange 62 65)
     (slice ~from_:62 ~to_:65 restored);
   assert_equal_int
-    "restored slice across boundary should read root and two leaves" 3 !reads;
+    "restored slice across boundary should reuse cached root and first leaf" 1 !reads;
   assert_equal_list
     "restored slice across boundary should access root and two leaves"
     [ "node-3"; "node-2"; root ]
@@ -1638,7 +1749,7 @@ let test_restored_reverse_slice_reads_only_overlapping_leaves () =
     (irange 65 62)
     (rslice ~from_:65 ~to_:62 restored);
   assert_equal_int
-    "restored reverse slice across boundary should read root and two leaves" 3
+    "restored reverse slice across boundary should reuse cached root and first leaf" 1
     !reads;
   assert_equal_list
     "restored reverse slice across boundary should access root and two leaves"
@@ -2144,6 +2255,8 @@ let () =
   test_to_list_materializes_tree_linearly ();
   test_settings_control_storage_branching_factor ();
   test_restore_preserves_settings_for_later_edits ();
+  test_ref_type_controls_restored_node_cache ();
+  test_reclaimable_ref_types_release_restored_nodes_after_gc ();
   test_settings_validate_branching_factor ();
   test_of_sorted_array_uses_sorted_input_and_settings ();
   test_sorted_order_and_uniqueness ();

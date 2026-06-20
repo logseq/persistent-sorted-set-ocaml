@@ -1,5 +1,6 @@
 type 'a comparator = 'a -> 'a -> int
-type settings = { branching_factor : int }
+type ref_type = Strong | Soft | Weak
+type settings = { branching_factor : int; ref_type : ref_type }
 type 'a stored_node = Leaf of 'a list | Branch of 'a list * string list
 
 type 'a storage = {
@@ -53,7 +54,7 @@ let normalize_cmp cmp left right =
   match cmp left right with n when n < 0 -> -1 | 0 -> 0 | _ -> 1
 
 let default_cmp left right = Stdlib.compare left right
-let default_settings = { branching_factor = 32 }
+let default_settings = { branching_factor = 32; ref_type = Soft }
 
 let validate_settings settings =
   if settings.branching_factor < 2 then
@@ -62,7 +63,64 @@ let validate_settings settings =
 
 let settings set = set.set_settings
 
+let cache_storage settings storage =
+  let remember cache address node =
+    let slot = Weak.create 1 in
+    Weak.set slot 0 (Some node);
+    Hashtbl.replace cache address slot
+  in
+  match settings.ref_type with
+  | Strong ->
+      let cache = Hashtbl.create 128 in
+      {
+        store_node =
+          (fun node ->
+            let address = storage.store_node node in
+            Hashtbl.replace cache address node;
+            address);
+        restore_node =
+          (fun address ->
+            match Hashtbl.find_opt cache address with
+            | Some node -> Some node
+            | None ->
+                (match storage.restore_node address with
+                | Some node ->
+                    Hashtbl.replace cache address node;
+                    Some node
+                | None -> None));
+        accessed = storage.accessed;
+      }
+  | Soft | Weak ->
+      let cache = Hashtbl.create 128 in
+      {
+        store_node =
+          (fun node ->
+            let address = storage.store_node node in
+            remember cache address node;
+            address);
+        restore_node =
+          (fun address ->
+            match Hashtbl.find_opt cache address with
+            | Some slot -> (
+                match Weak.get slot 0 with
+                | Some node -> Some node
+                | None -> (
+                    match storage.restore_node address with
+                    | Some node ->
+                        remember cache address node;
+                        Some node
+                    | None -> None))
+            | None -> (
+                match storage.restore_node address with
+                | Some node ->
+                    remember cache address node;
+                    Some node
+                | None -> None));
+        accessed = storage.accessed;
+      }
+
 let empty_with_cmp ?storage settings cmp =
+  let storage = Option.map (cache_storage settings) storage in
   {
     cmp;
     set_settings = settings;
@@ -1893,7 +1951,7 @@ let restore ?(cmp = default_cmp) ?(settings = default_settings) storage address
     {
       cmp = normalize_cmp cmp;
       set_settings = settings;
-      set_storage = Some storage;
+      set_storage = Some (cache_storage settings storage);
       data = Deferred { address };
       count_cache = None;
     }

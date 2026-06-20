@@ -12,8 +12,25 @@
  (modes js)
  (libraries persistent_sorted_set))
 
+(executable
+ (name js_memory_test)
+ (modes js)
+ (libraries persistent_sorted_set js_of_ocaml))
+
 (rule
  (alias runtest)
  (deps js_smoke.bc.js)
  (action
   (run node %{dep:js_smoke.bc.js})))
+
+(rule
+ (alias runtest)
+ (deps js_memory_test.bc.js)
+ (action
+  (run node --expose-gc %{dep:js_memory_test.bc.js})))
+
+(rule
+ (alias runtest)
+ (deps js_memory_test.bc.js run_browser_memory_test.js)
+ (action
+  (run node %{dep:run_browser_memory_test.js} %{dep:js_memory_test.bc.js})))
