@@ -47,9 +47,41 @@ let shuffled values =
   |> List.mapi (fun index value -> (index * 37 mod 97, value))
   |> List.sort compare |> List.map snd
 
+let shuffled_array size =
+  let values = Array.init size Fun.id in
+  let seed = ref 0x5eed in
+  for i = size - 1 downto 1 do
+    seed := ((!seed * 1_103_515_245) + 12_345) land 0x3fffffff;
+    let j = !seed mod (i + 1) in
+    let value = values.(i) in
+    values.(i) <- values.(j);
+    values.(j) <- value
+  done;
+  values
+
 let random_values seed length bound =
   let state = Random.State.make [| seed |] in
   List.init length (fun _ -> Random.State.int state bound)
+
+let best_time samples f =
+  let rec loop best remaining =
+    if remaining = 0 then best
+    else (
+      Gc.compact ();
+      let start = Sys.time () in
+      let result = f () in
+      let elapsed = Sys.time () -. start in
+      ignore (Sys.opaque_identity result);
+      let best =
+        match best with
+        | None -> Some elapsed
+        | Some best -> Some (min best elapsed)
+      in
+      loop best (remaining - 1))
+  in
+  match loop None samples with
+  | Some elapsed -> elapsed
+  | None -> invalid_arg "best_time requires at least one sample"
 
 let sorted_unique values = List.sort_uniq compare values
 
@@ -116,6 +148,91 @@ let bucket_range divisor ~from_ ~to_ values =
       let bucket = value / divisor in
       bucket >= from_ / divisor && bucket <= to_ / divisor)
     values
+
+let test_storage_backed_pure_trees_do_not_rescan_before_edits () =
+  let build_storage () =
+    let memory = Hashtbl.create 16 in
+    {
+      store_node =
+        (fun node ->
+          let address = "node-" ^ string_of_int (Hashtbl.length memory) in
+          Hashtbl.replace memory address node;
+          address);
+      restore_node = (fun address -> Hashtbl.find_opt memory address);
+      accessed = (fun _ -> ());
+    }
+  in
+  let values = irange 0 19_999 in
+  let storage = build_storage () in
+  let plain_add_time = best_time 3 (fun () -> of_list_by ~cmp:compare values) in
+  let storage_add_time =
+    best_time 3 (fun () -> of_list_by ~storage ~cmp:compare values)
+  in
+  if storage_add_time > plain_add_time *. 4. then
+    failf
+      "storage-backed pure add should avoid full-tree scans: plain %.4fs, \
+       storage %.4fs"
+      plain_add_time storage_add_time;
+  let values_array = Array.init 20_000 Fun.id in
+  let removals = List.init 10_000 (fun index -> index * 2) in
+  let plain = of_sorted_array_by ~cmp:compare values_array in
+  let storage_backed =
+    of_sorted_array_by ~storage:(build_storage ()) ~cmp:compare values_array
+  in
+  let plain_remove_time =
+    best_time 3 (fun () ->
+        List.fold_left (fun set value -> remove value set) plain removals)
+  in
+  let storage_remove_time =
+    best_time 3 (fun () ->
+        List.fold_left
+          (fun set value -> remove value set)
+          storage_backed removals)
+  in
+  if storage_remove_time > plain_remove_time *. 4. then
+    failf
+      "storage-backed pure remove should avoid full-tree scans: plain %.4fs, \
+       storage %.4fs"
+      plain_remove_time storage_remove_time
+
+let test_of_list_by_bulk_builds_without_chained_updates () =
+  let values = shuffled_array 50_000 in
+  let values_list = Array.to_list values in
+  let bulk_baseline_time =
+    best_time 3 (fun () ->
+        let sorted_values = Array.copy values in
+        Array.sort compare sorted_values;
+        of_sorted_array_by ~cmp:compare sorted_values)
+  in
+  let of_list_time =
+    best_time 3 (fun () -> of_list_by ~cmp:compare values_list)
+  in
+  if of_list_time > bulk_baseline_time *. 1.6 then
+    failf
+      "of_list_by should bulk-build after sorting instead of chaining updates: \
+       baseline %.4fs, of_list_by %.4fs"
+      bulk_baseline_time of_list_time;
+  let grouped =
+    of_list_by ~cmp:(quotient_compare 10) [ 21; 5; 14; 29; 3; 17; 11 ]
+  in
+  assert_equal_list
+    "of_list_by preserves first representatives for comparator-equal values"
+    [ 5; 14; 21 ] (to_list grouped)
+
+let test_to_list_materializes_tree_linearly () =
+  let set =
+    of_sorted_array_by ~settings:{ branching_factor = 2 } ~cmp:compare
+      (Array.init 50_000 Fun.id)
+  in
+  let fold_time =
+    best_time 3 (fun () -> fold (fun acc value -> value :: acc) [] set)
+  in
+  let to_list_time = best_time 3 (fun () -> to_list set) in
+  if to_list_time > fold_time *. 2.5 then
+    failf
+      "to_list should materialize without repeated list copying: fold %.4fs, \
+       to_list %.4fs"
+      fold_time to_list_time
 
 let test_settings_control_storage_branching_factor () =
   let memory = Hashtbl.create 16 in
@@ -1696,6 +1813,9 @@ let test_tree_slice_to_seq_seeks_lazily () =
       !comparisons
 
 let () =
+  test_storage_backed_pure_trees_do_not_rescan_before_edits ();
+  test_of_list_by_bulk_builds_without_chained_updates ();
+  test_to_list_materializes_tree_linearly ();
   test_settings_control_storage_branching_factor ();
   test_restore_preserves_settings_for_later_edits ();
   test_settings_validate_branching_factor ();

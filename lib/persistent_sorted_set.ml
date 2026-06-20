@@ -23,7 +23,7 @@ type 'a node = 'a Node.t
 
 type 'a data =
   | Empty
-  | Tree of { root : 'a node }
+  | Tree of { root : 'a node; has_stored_address : bool }
   | Deferred of { address : string }
 
 type 'a t = {
@@ -86,46 +86,57 @@ let chunks size values =
   in
   loop [] values
 
-let array_fold_right f values init =
+let prepend_array values init =
   let acc = ref init in
   for i = Array.length values - 1 downto 0 do
-    acc := f values.(i) !acc
+    acc := values.(i) :: !acc
   done;
   !acc
+
+let prepend_list values init =
+  List.fold_right (fun value acc -> value :: acc) values init
 
 let storage_required = function
   | Some storage -> storage
   | None -> invalid_arg "storage-backed node requires storage"
 
-let rec materialize_address storage address =
+let rec materialize_address_with storage address tail =
   storage.accessed address;
   match storage.restore_node address with
-  | Some (Leaf values) -> values
+  | Some (Leaf values) -> prepend_list values (tail ())
   | Some (Branch (_, child_addresses)) ->
-      List.concat_map (materialize_address storage) child_addresses
+      materialize_addresses_with storage child_addresses tail
   | None -> invalid_arg ("stored node not found: " ^ address)
 
-let rec materialize_node storage node =
+and materialize_addresses_with storage addresses tail =
+  match addresses with
+  | [] -> tail ()
+  | address :: rest ->
+      materialize_address_with storage address (fun () ->
+          materialize_addresses_with storage rest tail)
+
+let materialize_address storage address =
+  materialize_address_with storage address (fun () -> [])
+
+let rec materialize_node_into storage node acc =
   match node with
   | Node.Ref { address; _ } ->
-      materialize_address (storage_required storage) address
-  | Node.Leaf { values; _ } ->
-      array_fold_right (fun value acc -> value :: acc) values []
+      materialize_address_with (storage_required storage) address (fun () ->
+          acc)
+  | Node.Leaf { values; _ } -> prepend_array values acc
   | Node.Branch { children; _ } ->
-      array_fold_right
-        (fun child acc -> materialize_node storage child @ acc)
-        children []
+      let acc = ref acc in
+      for i = Array.length children - 1 downto 0 do
+        acc := materialize_node_into storage children.(i) !acc
+      done;
+      !acc
 
-let rec node_has_stored_address = function
-  | Node.Ref _ -> true
-  | Node.Leaf { address; _ } -> Option.is_some address
-  | Node.Branch { address; children; _ } ->
-      Option.is_some address || Array.exists node_has_stored_address children
+let materialize_node storage node = materialize_node_into storage node []
 
 let materialize set =
   match set.data with
   | Empty -> []
-  | Tree { root } -> materialize_node set.set_storage root
+  | Tree { root; _ } -> materialize_node set.set_storage root
   | Deferred { address } ->
       materialize_address (storage_required set.set_storage) address
 
@@ -179,12 +190,12 @@ let data_of_sorted_values settings values =
     |> node_leaf_refs_of_chunks |> node_of_refs settings
   with
   | None -> Empty
-  | Some root -> Tree { root }
+  | Some root -> Tree { root; has_stored_address = false }
 
-let data_of_changed_refs = function
+let data_of_changed_refs ~has_stored_address = function
   | [] -> Empty
-  | [ (_, root) ] -> Tree { root }
-  | children -> Tree { root = node_branch_of_refs children }
+  | [ (_, root) ] -> Tree { root; has_stored_address }
+  | children -> Tree { root = node_branch_of_refs children; has_stored_address }
 
 type 'a tree_edit_result =
   | Tree_edit_unchanged
@@ -504,9 +515,11 @@ let add value set =
       with
       | Tree_edit_unchanged -> set
       | Tree_edit_changed changed ->
-          { set with data = data_of_changed_refs changed })
-  | Tree { root }
-    when Option.is_some set.set_storage && node_has_stored_address root -> (
+          {
+            set with
+            data = data_of_changed_refs ~has_stored_address:true changed;
+          })
+  | Tree { root; has_stored_address = true } -> (
       let storage = storage_required set.set_storage in
       match
         add_to_node (Stored_tree storage) set.set_settings set.cmp equality_cmp
@@ -514,8 +527,11 @@ let add value set =
       with
       | Tree_edit_unchanged -> set
       | Tree_edit_changed changed ->
-          { set with data = data_of_changed_refs changed })
-  | Tree { root } -> (
+          {
+            set with
+            data = data_of_changed_refs ~has_stored_address:true changed;
+          })
+  | Tree { root; has_stored_address = false } -> (
       match
         add_to_node Pure_tree set.set_settings set.cmp equality_cmp key_cmp
           value root
@@ -527,18 +543,10 @@ let add value set =
             data =
               (match node_of_refs set.set_settings changed with
               | None -> Empty
-              | Some root -> Tree { root });
+              | Some root -> Tree { root; has_stored_address = false });
           })
   | Empty ->
       { set with data = data_of_sorted_values set.set_settings [ value ] }
-
-let of_list_by ?settings ?storage ?cmp values =
-  List.fold_left
-    (fun set value -> add value set)
-    (empty_by ?settings ?storage ?cmp ())
-    values
-
-let of_list values = of_list_by values
 
 let distinct_sorted_values cmp values =
   let rec loop acc = function
@@ -549,6 +557,28 @@ let distinct_sorted_values cmp values =
         | _ -> loop (value :: acc) rest)
   in
   loop [] values
+
+let distinct_sorted_array_values cmp values =
+  let acc = ref [] in
+  let previous = ref None in
+  for i = 0 to Array.length values - 1 do
+    let value = values.(i) in
+    match !previous with
+    | Some previous when cmp previous value = 0 -> ()
+    | _ ->
+        acc := value :: !acc;
+        previous := Some value
+  done;
+  List.rev !acc
+
+let of_list_by ?settings ?storage ?cmp values =
+  let set = empty_by ?settings ?storage ?cmp () in
+  let values = Array.of_list values in
+  Array.stable_sort set.cmp values;
+  let values = distinct_sorted_array_values set.cmp values in
+  { set with data = data_of_sorted_values set.set_settings values }
+
+let of_list values = of_list_by values
 
 let of_sorted_array_by ?settings ?storage ?cmp values =
   let set = empty_by ?settings ?storage ?cmp () in
@@ -573,9 +603,11 @@ let remove value set =
       with
       | Tree_edit_unchanged -> set
       | Tree_edit_changed changed ->
-          { set with data = data_of_changed_refs changed })
-  | Tree { root }
-    when Option.is_some set.set_storage && node_has_stored_address root -> (
+          {
+            set with
+            data = data_of_changed_refs ~has_stored_address:true changed;
+          })
+  | Tree { root; has_stored_address = true } -> (
       let storage = storage_required set.set_storage in
       match
         remove_from_node (Stored_tree storage) set.set_settings set.cmp
@@ -583,8 +615,11 @@ let remove value set =
       with
       | Tree_edit_unchanged -> set
       | Tree_edit_changed changed ->
-          { set with data = data_of_changed_refs changed })
-  | Tree { root } -> (
+          {
+            set with
+            data = data_of_changed_refs ~has_stored_address:true changed;
+          })
+  | Tree { root; has_stored_address = false } -> (
       match
         remove_from_node Pure_tree set.set_settings set.cmp equality_cmp key_cmp
           value root
@@ -596,7 +631,7 @@ let remove value set =
             data =
               (match node_of_refs set.set_settings changed with
               | None -> Empty
-              | Some root -> Tree { root });
+              | Some root -> Tree { root; has_stored_address = false });
           })
   | Empty -> set
 
@@ -663,7 +698,7 @@ let mem_in_node_by_cmp storage cmp value node =
 let mem value set =
   match set.data with
   | Empty -> false
-  | Tree { root } -> mem_in_node_by_cmp set.set_storage set.cmp value root
+  | Tree { root; _ } -> mem_in_node_by_cmp set.set_storage set.cmp value root
   | Deferred { address } ->
       mem_in_deferred
         (storage_required set.set_storage)
@@ -690,7 +725,8 @@ let rec fold_node storage f init = function
 
 let count (set : 'a t) =
   match set.data with
-  | Tree { root } -> fold_node set.set_storage (fun count _ -> count + 1) 0 root
+  | Tree { root; _ } ->
+      fold_node set.set_storage (fun count _ -> count + 1) 0 root
   | Empty -> 0
   | Deferred { address } ->
       fold_address
@@ -703,7 +739,7 @@ let to_list (set : 'a t) = materialize set
 let fold f init set =
   match set.data with
   | Empty -> init
-  | Tree { root } -> fold_node set.set_storage f init root
+  | Tree { root; _ } -> fold_node set.set_storage f init root
   | Deferred { address } ->
       fold_address (storage_required set.set_storage) f init address
 
@@ -1069,7 +1105,7 @@ let slice ?from_ ?to_ ?cmp (set : 'a t) =
   let cmp = Option.value ~default:set.cmp cmp in
   match set.data with
   | Empty -> []
-  | Tree { root } -> slice_tree set.set_storage cmp from_ to_ root
+  | Tree { root; _ } -> slice_tree set.set_storage cmp from_ to_ root
   | Deferred { address } ->
       slice_deferred (storage_required set.set_storage) cmp from_ to_ address
 
@@ -1077,7 +1113,7 @@ let rslice ?from_ ?to_ ?cmp (set : 'a t) =
   let cmp = Option.value ~default:set.cmp cmp in
   match set.data with
   | Empty -> []
-  | Tree { root } -> reverse_slice_tree set.set_storage cmp from_ to_ root
+  | Tree { root; _ } -> reverse_slice_tree set.set_storage cmp from_ to_ root
   | Deferred { address } ->
       reverse_slice_deferred
         (storage_required set.set_storage)
@@ -1086,7 +1122,7 @@ let rslice ?from_ ?to_ ?cmp (set : 'a t) =
 let seq_source_of_set set =
   match set.data with
   | Empty -> Seq_values []
-  | Tree { root } -> Seq_tree { storage = set.set_storage; root }
+  | Tree { root; _ } -> Seq_tree { storage = set.set_storage; root }
   | Deferred { address } ->
       Seq_deferred { storage = storage_required set.set_storage; address }
 
@@ -1283,7 +1319,7 @@ let store set =
   in
   match set.data with
   | Deferred { address } -> (address, set)
-  | Tree { root } when node_has_stored_address root ->
+  | Tree { root; has_stored_address = true } ->
       let address, _addresses = store_node_tree storage set.set_settings root in
       (address, stored_set address)
   | Empty ->
@@ -1291,7 +1327,7 @@ let store set =
         store_ordered_values storage set.set_settings (fun _add_value -> ())
       in
       (address, stored_set address)
-  | Tree { root } ->
+  | Tree { root; has_stored_address = false } ->
       let address =
         store_ordered_values storage set.set_settings (fun add_value ->
             ignore

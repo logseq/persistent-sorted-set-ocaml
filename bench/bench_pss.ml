@@ -9,12 +9,33 @@ type config = {
 
 let default_names =
   [
+    "empty-1M";
+    "settings-10K";
+    "of-list-50K";
+    "of-list-by-desc-50K";
+    "of-sorted-array-50K";
     "conj-10K";
     "disj-10K";
     "contains-10K";
+    "count-300K";
+    "to-list-300K";
     "doseq-300K";
     "next-300K";
     "reduce-300K";
+    "fold-list-300K";
+    "seq-to-list-300K";
+    "rseq-to-list-300K";
+    "to-seq-300K";
+    "seq-reverse-300K";
+    "fold-seq-300K";
+    "slice-300K";
+    "rslice-300K";
+    "slice-seq-300K";
+    "rslice-seq-300K";
+    "seek-300K";
+    "store-10K";
+    "restore-10K";
+    "restored-to-list-10K";
     "restored-chained-add-10K";
   ]
 
@@ -69,8 +90,12 @@ let shuffled_array size =
   values
 
 let ints_10k = shuffled_array 10_000
+let ints_50k = shuffled_array 50_000
+let ints_50k_list = Array.to_list ints_50k
+let sorted_50k = Array.init 50_000 Fun.id
 let set_10k = lazy (of_sorted_array (Array.init 10_000 Fun.id))
 let set_300k = lazy (of_sorted_array (Array.init 300_000 Fun.id))
+let list_300k = lazy (Array.to_list (Array.init 300_000 Fun.id))
 let blackhole = ref 0
 let consume_int value = blackhole := (!blackhole + value) land 0x3fffffff
 
@@ -97,6 +122,26 @@ let restored_10k =
      in
      (root, storage))
 
+let bench_empty_1m () =
+  let total = ref 0 in
+  for _ = 1 to 1_000_000 do
+    total := !total + count (empty ())
+  done;
+  consume_int !total
+
+let bench_settings_10k () =
+  Lazy.force set_10k |> settings |> fun settings ->
+  consume_int settings.branching_factor
+
+let bench_of_list_50k () = of_list ints_50k_list |> count |> consume_int
+
+let bench_of_list_by_desc_50k () =
+  of_list_by ~cmp:(fun left right -> compare right left) ints_50k_list
+  |> count |> consume_int
+
+let bench_of_sorted_array_50k () =
+  of_sorted_array sorted_50k |> count |> consume_int
+
 let bench_conj_10k () =
   let set = ref (empty ()) in
   for i = 0 to Array.length ints_10k - 1 do
@@ -119,6 +164,11 @@ let bench_contains_10k () =
   done;
   consume_int !found
 
+let bench_count_300k () = Lazy.force set_300k |> count |> consume_int
+
+let bench_to_list_300k () =
+  Lazy.force set_300k |> to_list |> List.length |> consume_int
+
 let bench_doseq_300k () =
   Lazy.force set_300k |> fold (fun () value -> consume_int value) ()
 
@@ -127,6 +177,76 @@ let bench_next_300k () =
 
 let bench_reduce_300k () =
   Lazy.force set_300k |> fold (fun sum value -> sum + value) 0 |> consume_int
+
+let bench_fold_list_300k () =
+  Lazy.force list_300k
+  |> fold_list (fun sum value -> sum + value) 0
+  |> consume_int
+
+let bench_seq_to_list_300k () =
+  Lazy.force set_300k |> seq |> seq_to_list |> List.length |> consume_int
+
+let bench_rseq_to_list_300k () =
+  Lazy.force set_300k |> rseq |> seq_to_list |> List.length |> consume_int
+
+let bench_to_seq_300k () =
+  Lazy.force set_300k |> seq |> to_seq
+  |> Seq.fold_left (fun sum value -> sum + value) 0
+  |> consume_int
+
+let bench_seq_reverse_300k () =
+  Lazy.force set_300k |> seq |> seq_reverse |> seq_to_list |> List.length
+  |> consume_int
+
+let bench_fold_seq_300k () =
+  Lazy.force set_300k |> seq
+  |> fold_seq (fun sum value -> sum + value) 0
+  |> consume_int
+
+let bench_slice_300k () =
+  Lazy.force set_300k
+  |> slice ~from_:100_000 ~to_:199_999
+  |> List.length |> consume_int
+
+let bench_rslice_300k () =
+  Lazy.force set_300k
+  |> rslice ~from_:199_999 ~to_:100_000
+  |> List.length |> consume_int
+
+let bench_slice_seq_300k () =
+  Lazy.force set_300k
+  |> slice_seq ~from_:100_000 ~to_:199_999
+  |> seq_to_list |> List.length |> consume_int
+
+let bench_rslice_seq_300k () =
+  Lazy.force set_300k
+  |> rslice_seq ~from_:199_999 ~to_:100_000
+  |> seq_to_list |> List.length |> consume_int
+
+let bench_seek_300k () =
+  Lazy.force set_300k |> seq |> seek 150_000 |> to_seq
+  |> Seq.fold_left (fun count _ -> count + 1) 0
+  |> consume_int
+
+let bench_store_10k () =
+  let storage = build_storage () in
+  let set =
+    of_sorted_array_by ~storage ~cmp:compare (Array.init 10_000 Fun.id)
+  in
+  set |> store |> fst |> String.length |> consume_int
+
+let bench_restore_10k () =
+  let restored_10k_root, restored_10k_storage = Lazy.force restored_10k in
+  match restore ~cmp:compare restored_10k_storage restored_10k_root with
+  | None -> invalid_arg "restored benchmark root missing"
+  | Some restored ->
+      settings restored |> fun settings -> consume_int settings.branching_factor
+
+let bench_restored_to_list_10k () =
+  let restored_10k_root, restored_10k_storage = Lazy.force restored_10k in
+  match restore ~cmp:compare restored_10k_storage restored_10k_root with
+  | None -> invalid_arg "restored benchmark root missing"
+  | Some restored -> restored |> to_list |> List.length |> consume_int
 
 let bench_restored_chained_add_10k () =
   let restored_10k_root, restored_10k_storage = Lazy.force restored_10k in
@@ -138,12 +258,33 @@ let bench_restored_chained_add_10k () =
 
 let benches =
   [
+    ("empty-1M", bench_empty_1m);
+    ("settings-10K", bench_settings_10k);
+    ("of-list-50K", bench_of_list_50k);
+    ("of-list-by-desc-50K", bench_of_list_by_desc_50k);
+    ("of-sorted-array-50K", bench_of_sorted_array_50k);
     ("conj-10K", bench_conj_10k);
     ("disj-10K", bench_disj_10k);
     ("contains-10K", bench_contains_10k);
+    ("count-300K", bench_count_300k);
+    ("to-list-300K", bench_to_list_300k);
     ("doseq-300K", bench_doseq_300k);
     ("next-300K", bench_next_300k);
     ("reduce-300K", bench_reduce_300k);
+    ("fold-list-300K", bench_fold_list_300k);
+    ("seq-to-list-300K", bench_seq_to_list_300k);
+    ("rseq-to-list-300K", bench_rseq_to_list_300k);
+    ("to-seq-300K", bench_to_seq_300k);
+    ("seq-reverse-300K", bench_seq_reverse_300k);
+    ("fold-seq-300K", bench_fold_seq_300k);
+    ("slice-300K", bench_slice_300k);
+    ("rslice-300K", bench_rslice_300k);
+    ("slice-seq-300K", bench_slice_seq_300k);
+    ("rslice-seq-300K", bench_rslice_seq_300k);
+    ("seek-300K", bench_seek_300k);
+    ("store-10K", bench_store_10k);
+    ("restore-10K", bench_restore_10k);
+    ("restored-to-list-10K", bench_restored_to_list_10k);
     ("restored-chained-add-10K", bench_restored_chained_add_10k);
   ]
 
