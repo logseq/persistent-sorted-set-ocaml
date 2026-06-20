@@ -10,7 +10,6 @@ type 'a storage = {
 
 type 'a t
 type 'a seq
-type 'a transient
 
 val default_settings : settings
 val settings : 'a t -> settings
@@ -44,10 +43,6 @@ val of_sorted_array_by :
 val add : 'a -> 'a t -> 'a t
 val remove : 'a -> 'a t -> 'a t
 val validate_invariants : 'a t -> unit
-val transient : 'a t -> 'a transient
-val add_transient : 'a -> 'a transient -> unit
-val remove_transient : 'a -> 'a transient -> unit
-val persistent : 'a transient -> 'a t
 val mem : 'a -> 'a t -> bool
 val count : 'a t -> int
 val to_list : 'a t -> 'a list

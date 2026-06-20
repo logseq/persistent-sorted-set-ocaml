@@ -24,7 +24,6 @@ let of_sorted_array_by ?settings ?storage ?cmp values =
 
 let add value set = Pss.add value set |> validate_set
 let remove value set = Pss.remove value set |> validate_set
-let persistent builder = Pss.persistent builder |> validate_set
 
 let store set =
   Pss.validate_invariants set;
@@ -1214,163 +1213,6 @@ let test_storage_add_preserves_unchanged_leaf_addresses () =
   assert_equal_list "added stored set keeps sorted values" (irange 0 100)
     (to_list added_stored)
 
-let test_transient_batches_adds_and_removes () =
-  let original = of_list_by ~cmp:compare [ 0; 1; 2; 3; 4; 5 ] in
-  let builder = transient original in
-  add_transient 6 builder;
-  add_transient 3 builder;
-  add_transient 7 builder;
-  remove_transient 1 builder;
-  remove_transient 4 builder;
-  remove_transient 42 builder;
-  assert_equal_list "transient edits do not mutate the persistent source"
-    [ 0; 1; 2; 3; 4; 5 ] (to_list original);
-  let changed = persistent builder in
-  assert_equal_list "persistent freezes batched transient edits"
-    [ 0; 2; 3; 5; 6; 7 ] (to_list changed);
-  assert_equal_int "persistent transient result maintains count" 6
-    (count changed);
-  assert_raises_invalid_arg "frozen transient rejects later adds" (fun () ->
-      add_transient 8 builder);
-  assert_raises_invalid_arg "frozen transient rejects later removes" (fun () ->
-      remove_transient 0 builder);
-  assert_raises_invalid_arg "frozen transient rejects double persistent"
-    (fun () -> ignore (persistent builder))
-
-let test_transient_matches_sequential_comparator_representatives () =
-  let cmp = quotient_compare 10 in
-  let builder = transient (empty_by ~cmp ()) in
-  add_transient 21 builder;
-  add_transient 25 builder;
-  add_transient 14 builder;
-  add_transient 17 builder;
-  remove_transient 20 builder;
-  add_transient 29 builder;
-  add_transient 28 builder;
-  assert_equal_list
-    "transient keeps the first comparator representative until removal"
-    [ 14; 29 ]
-    (to_list (persistent builder));
-  let sequential =
-    empty_by ~cmp () |> add 21 |> add 25 |> add 14 |> add 17 |> remove 20
-    |> add 29 |> add 28
-  in
-  assert_equal_list "transient matches sequential comparator semantics"
-    (to_list sequential) [ 14; 29 ]
-
-let test_empty_transient_add_bulk_builds_without_chained_updates () =
-  let values = shuffled_array 50_000 in
-  let values_list = Array.to_list values in
-  let bulk_time = best_time 3 (fun () -> of_list_by ~cmp:compare values_list) in
-  let transient_time =
-    best_time 3 (fun () ->
-        let builder = transient (empty_by ~cmp:compare ()) in
-        Array.iter (fun value -> add_transient value builder) values;
-        Pss.persistent builder)
-  in
-  if transient_time > bulk_time *. 1.35 then
-    failf
-      "empty transient add should bulk-build near of_list_by: bulk %.4fs, \
-       transient %.4fs"
-      bulk_time transient_time;
-  let builder = transient (empty_by ~cmp:compare ()) in
-  Array.iter (fun value -> add_transient value builder) values;
-  ignore (validate_set (Pss.persistent builder))
-
-let test_transient_single_add_avoids_full_tree_merge () =
-  let comparisons = ref 0 in
-  let cmp left right =
-    incr comparisons;
-    compare left right
-  in
-  let original = of_sorted_array_by ~cmp (Array.init 50_000 Fun.id) in
-  comparisons := 0;
-  let builder = transient original in
-  add_transient 50_000 builder;
-  let changed = Pss.persistent builder in
-  if !comparisons > 200 then
-    failf
-      "single transient add should edit by path instead of merging the full \
-       tree: %d comparisons"
-      !comparisons;
-  let changed = validate_set changed in
-  assert_equal_list "single transient add keeps the source persistent"
-    (irange 0 49_999) (to_list original);
-  assert_equal_int "single transient add updates count" 50_001 (count changed);
-  if not (mem 50_000 changed) then
-    failwith "single transient add should add the new value"
-
-let test_transient_creation_does_not_clone_large_tree () =
-  let original = of_sorted_array_by ~cmp:compare (Array.init 300_000 Fun.id) in
-  Gc.compact ();
-  let before = Gc.allocated_bytes () in
-  let builder = transient original in
-  let after = Gc.allocated_bytes () in
-  ignore (Sys.opaque_identity builder);
-  let allocated = after -. before in
-  if allocated > 100_000. then
-    failf "transient creation should not clone the full tree: %.0f bytes"
-      allocated
-
-let test_transient_repeated_leaf_adds_reuse_leaf_capacity () =
-  let settings = { branching_factor = 4_096 } in
-  let original =
-    of_sorted_array_by ~settings ~cmp:compare (Array.init 2_048 Fun.id)
-  in
-  let builder = transient original in
-  Gc.compact ();
-  let before = Gc.allocated_bytes () in
-  for value = 2_048 to 3_071 do
-    add_transient value builder
-  done;
-  let changed = Pss.persistent builder in
-  let after = Gc.allocated_bytes () in
-  let allocated = after -. before in
-  if allocated > 5_000_000. then
-    failf "repeated transient leaf adds should reuse leaf capacity: %.0f bytes"
-      allocated;
-  let changed = validate_set changed in
-  assert_equal_int "repeated transient leaf adds update count" 3_072
-    (count changed);
-  assert_equal_list "repeated transient leaf adds keep source persistent"
-    (irange 0 2_047) (to_list original)
-
-let test_transient_single_remove_avoids_full_tree_merge () =
-  let comparisons = ref 0 in
-  let cmp left right =
-    incr comparisons;
-    compare left right
-  in
-  let original = of_sorted_array_by ~cmp (Array.init 50_000 Fun.id) in
-  comparisons := 0;
-  let builder = transient original in
-  remove_transient 25_000 builder;
-  let changed = Pss.persistent builder in
-  if !comparisons > 200 then
-    failf
-      "single transient remove should edit by path instead of merging the full \
-       tree: %d comparisons"
-      !comparisons;
-  let changed = validate_set changed in
-  assert_equal_int "single transient remove keeps the source count" 50_000
-    (count original);
-  assert_equal_int "single transient remove updates count" 49_999
-    (count changed);
-  if mem 25_000 changed then
-    failwith "single transient remove should remove the target value"
-
-let test_transient_can_add_after_removing_all_values () =
-  let original = of_list_by ~cmp:compare [ 1; 2; 3 ] in
-  let builder = transient original in
-  remove_transient 1 builder;
-  remove_transient 2 builder;
-  remove_transient 3 builder;
-  add_transient 4 builder;
-  assert_equal_list "transient add after clearing keeps the source persistent"
-    [ 1; 2; 3 ] (to_list original);
-  assert_equal_list "transient add after clearing creates a new singleton" [ 4 ]
-    (to_list (persistent builder))
-
 let test_restored_add_preserves_unchanged_leaf_addresses_lazily () =
   let memory = Hashtbl.create 16 in
   let writes = ref 0 in
@@ -1413,45 +1255,6 @@ let test_restored_add_preserves_unchanged_leaf_addresses_lazily () =
     (stored_addresses memory appended_root);
   assert_equal_list "restored add keeps sorted values" (irange 0 101)
     (to_list appended_stored)
-
-let test_restored_transient_add_reads_only_edit_path () =
-  let memory = Hashtbl.create 16 in
-  let writes = ref 0 in
-  let reads = ref 0 in
-  let accessed = ref [] in
-  let storage =
-    {
-      store_node =
-        (fun node ->
-          incr writes;
-          let address = "node-" ^ string_of_int !writes in
-          Hashtbl.replace memory address node;
-          address);
-      restore_node =
-        (fun address ->
-          incr reads;
-          Hashtbl.find_opt memory address);
-      accessed = (fun address -> accessed := address :: !accessed);
-    }
-  in
-  let root, _ = store (of_list_by ~storage ~cmp:compare (irange 0 100)) in
-  reads := 0;
-  accessed := [];
-  let restored =
-    match restore ~cmp:compare storage root with
-    | Some restored -> restored
-    | None -> failwith "restore should find the stored root"
-  in
-  let builder = transient restored in
-  add_transient 101 builder;
-  let appended = Pss.persistent builder in
-  assert_equal_int "restored transient add reads only root and target leaf" 2
-    !reads;
-  assert_equal_list "restored transient add accesses only root and target leaf"
-    [ "node-4"; root ] !accessed;
-  let appended = validate_set appended in
-  assert_equal_list "restored transient add keeps sorted values" (irange 0 101)
-    (to_list appended)
 
 let test_chained_restored_adds_keep_edit_path_without_rebuilding () =
   let memory = Hashtbl.create 16 in
@@ -2303,16 +2106,7 @@ let () =
   test_storage_remove_borrows_from_right_sibling ();
   test_nested_storage_remove_borrows_branch_from_right_sibling ();
   test_storage_add_preserves_unchanged_leaf_addresses ();
-  test_transient_batches_adds_and_removes ();
-  test_transient_matches_sequential_comparator_representatives ();
-  test_empty_transient_add_bulk_builds_without_chained_updates ();
-  test_transient_single_add_avoids_full_tree_merge ();
-  test_transient_creation_does_not_clone_large_tree ();
-  test_transient_repeated_leaf_adds_reuse_leaf_capacity ();
-  test_transient_single_remove_avoids_full_tree_merge ();
-  test_transient_can_add_after_removing_all_values ();
   test_restored_add_preserves_unchanged_leaf_addresses_lazily ();
-  test_restored_transient_add_reads_only_edit_path ();
   test_chained_restored_adds_keep_edit_path_without_rebuilding ();
   test_restored_remove_preserves_unchanged_leaf_addresses_lazily ();
   test_restored_mem_reads_only_needed_leaves ();

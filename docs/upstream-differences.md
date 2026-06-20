@@ -32,10 +32,10 @@ removal, membership, range slicing, reverse slicing, seeking, storing, restoring
 and lazy access to restored storage paths.
 
 It is not a literal port. The upstream ClojureScript implementation is a
-Clojure collection with protocols, metadata, hashing, transients, chunked
-sequences, mutable address caches, weak references, and path-encoded iterators.
-The OCaml implementation is a standalone module with opaque set and sequence
-types, explicit storage callbacks, optional comparator overrides, and a simpler
+Clojure collection with protocols, metadata, hashing, chunked sequences, mutable
+address caches, weak references, and path-encoded iterators. The OCaml
+implementation is a standalone module with opaque set and sequence types,
+explicit storage callbacks, optional comparator overrides, and a simpler
 tree/edit representation.
 
 The largest implementation differences are:
@@ -51,8 +51,7 @@ The largest implementation differences are:
 - Upstream stores mutable node address caches and can call storage `delete`.
   OCaml storage has no delete operation and tracks reusable chunks outside the
   main in-memory tree.
-- Upstream implements Clojure protocols and transients. OCaml exposes a focused
-  module API and has no transient/mutable builder.
+- Upstream implements Clojure protocols. OCaml exposes a focused module API.
 
 ## Data Structure Shape
 
@@ -109,13 +108,11 @@ The upstream ClojureScript set participates in Clojure collection protocols:
 - unordered hash
 - function invocation as lookup
 - sequence, reverse sequence, chunked sequence, and reduce protocols
-- transient collection APIs
 - print protocols
 
 The OCaml module does not implement equivalents for metadata, hash, equality
-against other set types, transient mutation, or Clojure protocol integration.
-This is a reasonable simplification for an OCaml library, but it is a
-compatibility difference.
+against other set types or Clojure protocol integration. This is a reasonable
+simplification for an OCaml library, but it is a compatibility difference.
 
 ### OCaml Features Not Present in the Same Form Upstream
 
@@ -349,7 +346,6 @@ Known upstream behavior that is not directly represented:
 - Clojure protocol behavior
 - hashing and equality semantics
 - metadata
-- transients
 - chunked sequence protocol details
 - storage `delete`
 - durable and loaded ratio helpers from JVM storage tests
@@ -375,4 +371,3 @@ Keep the existing upstream name coverage script. Add targeted parity tests for:
 - restored `count` behavior once metadata is added
 - storage deletion or explicit no-delete semantics
 - construction from large unordered lists compared with upstream
-

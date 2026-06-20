@@ -11,16 +11,10 @@ type 'a storage = {
 module Node = struct
   type 'a t =
     | Ref of { max_key : 'a; address : string; mutable cached : 'a t option }
-    | Leaf of {
-        mutable values : 'a array;
-        mutable len : int;
-        mutable owner : int option;
-        address : string option;
-      }
+    | Leaf of { values : 'a array; len : int; address : string option }
     | Branch of {
-        mutable keys : 'a array;
-        mutable children : 'a t array;
-        mutable owner : int option;
+        keys : 'a array;
+        children : 'a t array;
         address : string option;
       }
 end
@@ -38,16 +32,6 @@ type 'a t = {
   set_storage : 'a storage option;
   data : 'a data;
   count_cache : int option;
-}
-
-type 'a transient_op = Add_transient of 'a | Remove_transient of 'a
-
-type 'a transient = {
-  base : 'a t;
-  mutable operations : 'a transient_op list;
-  mutable working : 'a t option;
-  owner : int;
-  mutable active : bool;
 }
 
 type direction = Asc | Desc
@@ -197,7 +181,6 @@ let node_branch_of_refs refs =
     {
       keys = Array.of_list keys;
       children = Array.of_list children;
-      owner = None;
       address = None;
     }
 
@@ -206,8 +189,7 @@ let node_leaf_refs_of_chunks chunks =
   |> List.map (fun chunk ->
       let values = Array.of_list chunk in
       ( values.(Array.length values - 1),
-        Node.Leaf
-          { values; len = Array.length values; owner = None; address = None } ))
+        Node.Leaf { values; len = Array.length values; address = None } ))
 
 let rec node_of_refs settings = function
   | [] -> None
@@ -274,24 +256,20 @@ let tree_leaf_refs_of_arrays arrays =
   arrays
   |> List.map (fun values ->
       ( values.(Array.length values - 1),
-        Node.Leaf
-          { values; len = Array.length values; owner = None; address = None } ))
+        Node.Leaf { values; len = Array.length values; address = None } ))
 
 let tree_branch_refs_of_arrays settings keys children =
   let length = Array.length keys in
   if length = 0 then []
   else if length <= settings.branching_factor then
-    [
-      ( keys.(length - 1),
-        Node.Branch { keys; children; owner = None; address = None } );
-    ]
+    [ (keys.(length - 1), Node.Branch { keys; children; address = None }) ]
   else
     let key_chunks = array_split keys in
     let child_chunks = array_split children in
     List.map2
       (fun keys children ->
         ( keys.(Array.length keys - 1),
-          Node.Branch { keys; children; owner = None; address = None } ))
+          Node.Branch { keys; children; address = None } ))
       key_chunks child_chunks
 
 let stored_branch_refs_of_arrays settings keys children =
@@ -306,13 +284,7 @@ let stored_branch_refs_of_arrays settings keys children =
       let key_chunk = Array.sub keys offset chunk_length in
       let child_chunk = Array.sub children offset chunk_length in
       let branch =
-        Node.Branch
-          {
-            keys = key_chunk;
-            children = child_chunk;
-            owner = None;
-            address = None;
-          }
+        Node.Branch { keys = key_chunk; children = child_chunk; address = None }
       in
       loop
         ((key_chunk.(chunk_length - 1), branch) :: acc)
@@ -378,28 +350,14 @@ let array_append left right =
 let leaf_ref values =
   if Array.length values = 0 then invalid_arg "leaf ref requires values";
   ( values.(Array.length values - 1),
-    Node.Leaf
-      { values; len = Array.length values; owner = None; address = None } )
+    Node.Leaf { values; len = Array.length values; address = None } )
 
 let branch_ref keys children =
   let length = Array.length keys in
   if length = 0 then invalid_arg "branch ref requires keys";
   if length <> Array.length children then
     invalid_arg "branch keys and children arity mismatch";
-  ( keys.(length - 1),
-    Node.Branch { keys; children; owner = None; address = None } )
-
-let ref_of_node = function
-  | Node.Ref { max_key; _ } as node -> (max_key, node)
-  | Node.Leaf { values; len; _ } as node ->
-      if len = 0 then invalid_arg "leaf ref requires values";
-      (values.(len - 1), node)
-  | Node.Branch { keys; children; _ } as node ->
-      let length = Array.length keys in
-      if length = 0 then invalid_arg "branch ref requires keys";
-      if length <> Array.length children then
-        invalid_arg "branch keys and children arity mismatch";
-      (keys.(length - 1), node)
+  (keys.(length - 1), Node.Branch { keys; children; address = None })
 
 let total_cmp order_cmp equality_cmp left right =
   match order_cmp left right with 0 -> equality_cmp left right | n -> n
@@ -482,20 +440,13 @@ let node_of_stored_branch keys child_addresses address =
         Node.Ref { max_key = key; address = child_address; cached = None })
       child_addresses
   in
-  Node.Branch
-    { keys = Array.copy keys; children; owner = None; address = Some address }
+  Node.Branch { keys = Array.copy keys; children; address = Some address }
 
 let node_of_stored_node storage address =
   match restore_stored_node storage address with
   | Leaf values ->
       let values = Array.of_list values in
-      Node.Leaf
-        {
-          values;
-          len = Array.length values;
-          owner = None;
-          address = Some address;
-        }
+      Node.Leaf { values; len = Array.length values; address = Some address }
   | Branch (keys, child_addresses) ->
       node_of_stored_branch keys child_addresses address
 
@@ -743,7 +694,6 @@ let rec add_to_address storage settings order_cmp equality_cmp key_cmp value
            {
              values = Array.of_list values;
              len = List.length values;
-             owner = None;
              address = Some address;
            })
   | Branch (keys, child_addresses) ->
@@ -787,7 +737,6 @@ let rec remove_from_address storage settings order_cmp equality_cmp key_cmp
            {
              values = Array.of_list values;
              len = List.length values;
-             owner = None;
              address = Some address;
            })
   | Branch (keys, child_addresses) ->
@@ -812,12 +761,7 @@ and remove_from_node mode settings order_cmp equality_cmp key_cmp value =
                 [
                   ( values.(Array.length values - 1),
                     Node.Leaf
-                      {
-                        values;
-                        len = Array.length values;
-                        owner = None;
-                        address = None;
-                      } );
+                      { values; len = Array.length values; address = None } );
                 ]))
   | Node.Branch { keys; children; _ } -> (
       let index = find_child_index key_cmp value keys in
@@ -845,303 +789,6 @@ and remove_from_node mode settings order_cmp equality_cmp key_cmp value =
           let keys, children = branch_splice_one keys children index changed in
           branch_refs_of_arrays settings mode keys children |> fun changed ->
           Tree_edit_changed changed)
-
-let transient_owner_counter = ref 0
-
-let next_transient_owner () =
-  incr transient_owner_counter;
-  !transient_owner_counter
-
-let owned_transient_node owner node =
-  match node with
-  | Node.Ref _ -> invalid_arg "transient tree should not contain stored refs"
-  | Node.Leaf leaf when leaf.owner = Some owner -> node
-  | Node.Leaf { values; len; _ } ->
-      let capacity = max (len + 1) (len * 2) in
-      let copied = Array.make capacity values.(0) in
-      Array.blit values 0 copied 0 len;
-      Node.Leaf { values = copied; len; owner = Some owner; address = None }
-  | Node.Branch branch when branch.owner = Some owner -> node
-  | Node.Branch { keys; children; _ } ->
-      Node.Branch
-        {
-          keys = Array.copy keys;
-          children = Array.copy children;
-          owner = Some owner;
-          address = None;
-        }
-
-let transient_leaf_refs_of_arrays owner node arrays =
-  match arrays with
-  | [] -> []
-  | first :: rest ->
-      (match node with
-      | Node.Leaf leaf ->
-          leaf.values <- first;
-          leaf.len <- Array.length first
-      | Node.Ref _ | Node.Branch _ -> invalid_arg "transient leaf expected");
-      ref_of_node node
-      :: List.map
-           (fun values ->
-             ( values.(Array.length values - 1),
-               Node.Leaf
-                 {
-                   values;
-                   len = Array.length values;
-                   owner = Some owner;
-                   address = None;
-                 } ))
-           rest
-
-let transient_branch_refs_of_arrays owner settings node keys children =
-  let length = Array.length keys in
-  if length = 0 then []
-  else if length <= settings.branching_factor then (
-    (match node with
-    | Node.Branch branch ->
-        branch.keys <- keys;
-        branch.children <- children
-    | Node.Ref _ | Node.Leaf _ -> invalid_arg "transient branch expected");
-    [ ref_of_node node ])
-  else
-    let key_chunks = array_split keys in
-    let child_chunks = array_split children in
-    match (key_chunks, child_chunks) with
-    | first_keys :: rest_keys, first_children :: rest_children ->
-        (match node with
-        | Node.Branch branch ->
-            branch.keys <- first_keys;
-            branch.children <- first_children
-        | Node.Ref _ | Node.Leaf _ -> invalid_arg "transient branch expected");
-        ref_of_node node
-        :: List.map2
-             (fun keys children ->
-               ( keys.(Array.length keys - 1),
-                 Node.Branch
-                   { keys; children; owner = Some owner; address = None } ))
-             rest_keys rest_children
-    | _ -> invalid_arg "transient branch split expected chunks"
-
-let transient_branch_of_refs owner refs =
-  let keys, children = List.split refs in
-  Node.Branch
-    {
-      keys = Array.of_list keys;
-      children = Array.of_list children;
-      owner = Some owner;
-      address = None;
-    }
-
-let rec add_to_transient_node owner settings order_cmp equality_cmp key_cmp
-    value node =
-  match node with
-  | Node.Ref _ -> invalid_arg "transient tree should not contain stored refs"
-  | Node.Leaf leaf -> (
-      match
-        find_insert_index_len order_cmp equality_cmp value leaf.values leaf.len
-      with
-      | `Found _ -> Tree_edit_unchanged
-      | `Insert index -> (
-          let node = owned_transient_node owner node in
-          match node with
-          | Node.Leaf leaf ->
-              let new_len = leaf.len + 1 in
-              let changed =
-                if new_len <= settings.branching_factor then (
-                  if new_len > Array.length leaf.values then (
-                    let capacity =
-                      max new_len
-                        (min settings.branching_factor
-                           (Array.length leaf.values * 2))
-                    in
-                    let values = Array.make capacity value in
-                    Array.blit leaf.values 0 values 0 index;
-                    values.(index) <- value;
-                    Array.blit leaf.values index values (index + 1)
-                      (leaf.len - index);
-                    leaf.values <- values)
-                  else (
-                    Array.blit leaf.values index leaf.values (index + 1)
-                      (leaf.len - index);
-                    leaf.values.(index) <- value);
-                  leaf.len <- new_len;
-                  [ ref_of_node node ])
-                else
-                  transient_leaf_refs_of_arrays owner node
-                    (array_split
-                       (array_insert_len leaf.values leaf.len index value))
-              in
-              Tree_edit_changed changed
-          | Node.Ref _ | Node.Branch _ -> invalid_arg "transient leaf expected")
-      )
-  | Node.Branch branch -> (
-      let index = find_child_index key_cmp value branch.keys in
-      match
-        add_to_transient_node owner settings order_cmp equality_cmp key_cmp
-          value branch.children.(index)
-      with
-      | Tree_edit_unchanged -> Tree_edit_unchanged
-      | Tree_edit_changed [ (key, child) ] -> (
-          let node = owned_transient_node owner node in
-          match node with
-          | Node.Branch branch ->
-              branch.keys.(index) <- key;
-              branch.children.(index) <- child;
-              Tree_edit_changed [ ref_of_node node ]
-          | Node.Ref _ | Node.Leaf _ -> invalid_arg "transient branch expected")
-      | Tree_edit_changed changed -> (
-          let node = owned_transient_node owner node in
-          match node with
-          | Node.Branch branch ->
-              let keys, children =
-                branch_splice_one branch.keys branch.children index changed
-              in
-              Tree_edit_changed
-                (transient_branch_refs_of_arrays owner settings node keys
-                   children)
-          | Node.Ref _ | Node.Leaf _ -> invalid_arg "transient branch expected")
-      )
-
-let rec remove_from_transient_node owner settings order_cmp equality_cmp key_cmp
-    value node =
-  match node with
-  | Node.Ref _ -> invalid_arg "transient tree should not contain stored refs"
-  | Node.Leaf leaf -> (
-      match
-        find_remove_index_len order_cmp equality_cmp value leaf.values leaf.len
-      with
-      | None -> Tree_edit_unchanged
-      | Some index -> (
-          let node = owned_transient_node owner node in
-          match node with
-          | Node.Leaf leaf ->
-              let new_len = leaf.len - 1 in
-              if new_len = 0 then Tree_edit_changed []
-              else (
-                Array.blit leaf.values (index + 1) leaf.values index
-                  (leaf.len - index - 1);
-                leaf.len <- new_len;
-                Tree_edit_changed [ ref_of_node node ])
-          | Node.Ref _ | Node.Branch _ -> invalid_arg "transient leaf expected")
-      )
-  | Node.Branch branch -> (
-      let index = find_child_index key_cmp value branch.keys in
-      match
-        remove_from_transient_node owner settings order_cmp equality_cmp key_cmp
-          value branch.children.(index)
-      with
-      | Tree_edit_unchanged -> Tree_edit_unchanged
-      | Tree_edit_changed [ (key, child) ] -> (
-          let node = owned_transient_node owner node in
-          match node with
-          | Node.Branch branch ->
-              let changed =
-                match
-                  rebalance_leaf_child Pure_tree settings branch.keys
-                    branch.children index child
-                with
-                | Some changed -> changed
-                | None -> (
-                    match
-                      rebalance_branch_child Pure_tree settings branch.keys
-                        branch.children index child
-                    with
-                    | Some changed -> changed
-                    | None ->
-                        branch.keys.(index) <- key;
-                        branch.children.(index) <- child;
-                        [ ref_of_node node ])
-              in
-              Tree_edit_changed changed
-          | Node.Ref _ | Node.Leaf _ -> invalid_arg "transient branch expected")
-      | Tree_edit_changed changed -> (
-          let node = owned_transient_node owner node in
-          match node with
-          | Node.Branch branch ->
-              let keys, children =
-                branch_splice_one branch.keys branch.children index changed
-              in
-              Tree_edit_changed
-                (transient_branch_refs_of_arrays owner settings node keys
-                   children)
-          | Node.Ref _ | Node.Leaf _ -> invalid_arg "transient branch expected")
-      )
-
-let rec transient_tree_result owner settings refs =
-  match refs with
-  | [] -> Empty
-  | [ (_, root) ] -> Tree { root; has_stored_address = false }
-  | refs -> (
-      match refs |> chunks settings.branching_factor with
-      | [] -> Empty
-      | [ refs ] ->
-          Tree
-            {
-              root = transient_branch_of_refs owner refs;
-              has_stored_address = false;
-            }
-      | ref_chunks ->
-          let refs =
-            List.map
-              (fun refs ->
-                let node = transient_branch_of_refs owner refs in
-                (node_ref_key refs, node))
-              ref_chunks
-          in
-          transient_tree_result owner settings refs)
-
-let add_to_transient_set owner value set =
-  match set.data with
-  | Tree { root; has_stored_address = false } -> (
-      match
-        add_to_transient_node owner set.set_settings set.cmp set.cmp set.cmp
-          value root
-      with
-      | Tree_edit_unchanged -> set
-      | Tree_edit_changed changed ->
-          {
-            set with
-            data = transient_tree_result owner set.set_settings changed;
-            count_cache = Option.map (fun count -> count + 1) set.count_cache;
-          })
-  | Empty ->
-      {
-        set with
-        data =
-          Tree
-            {
-              root =
-                Node.Leaf
-                  {
-                    values = [| value |];
-                    len = 1;
-                    owner = Some owner;
-                    address = None;
-                  };
-              has_stored_address = false;
-            };
-        count_cache = Some 1;
-      }
-  | Deferred _ | Tree { has_stored_address = true; _ } ->
-      invalid_arg "transient path edit requires an in-memory tree"
-
-let remove_from_transient_set owner value set =
-  match set.data with
-  | Tree { root; has_stored_address = false } -> (
-      match
-        remove_from_transient_node owner set.set_settings set.cmp set.cmp
-          set.cmp value root
-      with
-      | Tree_edit_unchanged -> set
-      | Tree_edit_changed changed ->
-          {
-            set with
-            data = transient_tree_result owner set.set_settings changed;
-            count_cache = Option.map (fun count -> count - 1) set.count_cache;
-          })
-  | Empty -> set
-  | Deferred _ | Tree { has_stored_address = true; _ } ->
-      invalid_arg "transient path edit requires an in-memory tree"
 
 let add value set =
   let equality_cmp = set.cmp in
@@ -1429,196 +1076,6 @@ let validate_invariants set =
                 "count cache must match actual tree cardinality"
           | None -> ())
       | None -> ())
-
-type 'a normalized_transient_op = {
-  op_value : 'a;
-  op_is_add : bool;
-  op_replaces_existing : bool;
-}
-
-type 'a transient_presence =
-  | Transient_absent
-  | Transient_existing
-  | Transient_new of 'a
-
-let transient_working_set set =
-  match set.data with
-  | Tree { has_stored_address = false; _ } -> Some set
-  | Empty | Deferred _ | Tree { has_stored_address = true; _ } -> None
-
-let transient set =
-  let owner = next_transient_owner () in
-  {
-    base = set;
-    operations = [];
-    working = transient_working_set set;
-    owner;
-    active = true;
-  }
-
-let ensure_transient_active builder =
-  if not builder.active then invalid_arg "transient builder is no longer active"
-
-let add_transient value builder =
-  ensure_transient_active builder;
-  match builder.working with
-  | Some working ->
-      builder.working <- Some (add_to_transient_set builder.owner value working)
-  | None -> builder.operations <- Add_transient value :: builder.operations
-
-let remove_transient value builder =
-  ensure_transient_active builder;
-  match builder.working with
-  | Some working ->
-      builder.working <-
-        Some (remove_from_transient_set builder.owner value working)
-  | None -> builder.operations <- Remove_transient value :: builder.operations
-
-let value_of_transient_op = function
-  | Add_transient value | Remove_transient value -> value
-
-let normalize_transient_operations cmp operations =
-  let operations = operations |> List.rev |> Array.of_list in
-  Array.stable_sort
-    (fun left right ->
-      cmp (value_of_transient_op left) (value_of_transient_op right))
-    operations;
-  let length = Array.length operations in
-  let apply_op presence op =
-    match op with
-    | Remove_transient _ -> Transient_absent
-    | Add_transient value -> (
-        match presence with
-        | Transient_absent -> Transient_new value
-        | Transient_existing | Transient_new _ -> presence)
-  in
-  let normalized_from_group fallback existing_state absent_state =
-    match (existing_state, absent_state) with
-    | Transient_absent, _ | _, Transient_absent ->
-        { op_value = fallback; op_is_add = false; op_replaces_existing = false }
-    | Transient_existing, Transient_new value ->
-        { op_value = value; op_is_add = true; op_replaces_existing = false }
-    | Transient_new value, Transient_new _ ->
-        { op_value = value; op_is_add = true; op_replaces_existing = true }
-    | Transient_existing, Transient_existing ->
-        { op_value = fallback; op_is_add = true; op_replaces_existing = false }
-    | Transient_new value, Transient_existing ->
-        { op_value = value; op_is_add = true; op_replaces_existing = true }
-  in
-  let rec collect acc index =
-    if index >= length then List.rev acc
-    else
-      let first_value = value_of_transient_op operations.(index) in
-      let rec group existing_state absent_state next =
-        if next >= length then (existing_state, absent_state, next)
-        else
-          let op = operations.(next) in
-          let value = value_of_transient_op op in
-          if cmp value first_value <> 0 then (existing_state, absent_state, next)
-          else
-            group
-              (apply_op existing_state op)
-              (apply_op absent_state op) (next + 1)
-      in
-      let existing_state, absent_state, next =
-        group
-          (apply_op Transient_existing operations.(index))
-          (apply_op Transient_absent operations.(index))
-          (index + 1)
-      in
-      collect
-        (normalized_from_group first_value existing_state absent_state :: acc)
-        next
-  in
-  collect [] 0
-
-let merge_transient_operations cmp base_values operations =
-  let rec loop acc base_values operations =
-    match (base_values, operations) with
-    | [], [] -> List.rev acc
-    | [], op :: operations ->
-        let acc = if op.op_is_add then op.op_value :: acc else acc in
-        loop acc [] operations
-    | value :: rest, [] -> loop (value :: acc) rest []
-    | value :: rest, op :: operations -> (
-        match cmp value op.op_value with
-        | n when n < 0 -> loop (value :: acc) rest (op :: operations)
-        | 0 ->
-            if op.op_is_add then
-              let kept =
-                if op.op_replaces_existing then op.op_value else value
-              in
-              loop (kept :: acc) rest operations
-            else loop acc rest operations
-        | _ ->
-            let acc = if op.op_is_add then op.op_value :: acc else acc in
-            loop acc base_values operations)
-  in
-  loop [] base_values operations
-
-let add_values_of_transient_operations operations =
-  let rec loop acc = function
-    | [] -> Some acc
-    | Add_transient value :: operations -> loop (value :: acc) operations
-    | Remove_transient _ :: _ -> None
-  in
-  loop [] operations
-
-let persistent_from_empty_adds builder values =
-  let values = Array.of_list values in
-  Array.stable_sort builder.base.cmp values;
-  let values = distinct_sorted_array_values builder.base.cmp values in
-  {
-    builder.base with
-    data = data_of_sorted_values builder.base.set_settings values;
-    count_cache = Some (List.length values);
-  }
-
-let transient_should_replay_path set =
-  match set.data with
-  | Deferred _ -> true
-  | Tree { has_stored_address; _ } -> has_stored_address
-  | Empty -> false
-
-let apply_transient_operation set = function
-  | Add_transient value -> add value set
-  | Remove_transient value -> remove value set
-
-let persistent_by_replay builder operations =
-  List.fold_left apply_transient_operation builder.base (List.rev operations)
-
-let persistent builder =
-  ensure_transient_active builder;
-  builder.active <- false;
-  match builder.working with
-  | Some working -> working
-  | None -> (
-      match builder.operations with
-      | [] -> builder.base
-      | operations -> (
-          let fast_empty_adds =
-            match builder.base.data with
-            | Empty -> add_values_of_transient_operations operations
-            | Tree _ | Deferred _ -> None
-          in
-          match fast_empty_adds with
-          | Some values -> persistent_from_empty_adds builder values
-          | None ->
-              if transient_should_replay_path builder.base then
-                persistent_by_replay builder operations
-              else
-                let operations =
-                  normalize_transient_operations builder.base.cmp operations
-                in
-                let values =
-                  merge_transient_operations builder.base.cmp
-                    (materialize builder.base) operations
-                in
-                {
-                  builder.base with
-                  data = data_of_sorted_values builder.base.set_settings values;
-                  count_cache = Some (List.length values);
-                }))
 
 type search_step = Found | Stop | Continue
 

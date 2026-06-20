@@ -15,17 +15,13 @@ let default_names =
     "of-list-by-desc-50K";
     "of-sorted-array-50K";
     "conj-10K";
-    "transient-create-300K";
-    "transient-add-10K";
+    "add-single-50K";
+    "add-10-50K";
     "add-50K-plus-10K";
-    "transient-add-50K-plus-10K";
-    "transient-single-add-50K";
-    "transient-leaf-add-1K";
     "disj-10K";
-    "transient-remove-10K";
+    "remove-single-50K";
+    "remove-10-50K";
     "remove-50K-minus-10K";
-    "transient-remove-50K-minus-10K";
-    "transient-single-remove-50K";
     "contains-10K";
     "count-300K";
     "to-list-300K";
@@ -210,17 +206,15 @@ let bench_conj_10k () =
   done;
   consume_int (count !set)
 
-let bench_transient_create_300k () =
-  let builder = transient (Lazy.force set_300k) in
-  ignore (Sys.opaque_identity builder);
-  consume_int 1
+let bench_add_single_50k () =
+  Lazy.force set_50k |> add 50_000 |> count |> consume_int
 
-let bench_transient_add_10k () =
-  let builder = transient (empty ()) in
-  for i = 0 to Array.length ints_10k - 1 do
-    add_transient ints_10k.(i) builder
+let bench_add_10_50k () =
+  let set = ref (Lazy.force set_50k) in
+  for i = 0 to 9 do
+    set := add (50_000 + i) !set
   done;
-  builder |> persistent |> count |> consume_int
+  consume_int (count !set)
 
 let bench_add_50k_plus_10k () =
   let set = ref (Lazy.force set_50k) in
@@ -229,29 +223,6 @@ let bench_add_50k_plus_10k () =
   done;
   consume_int (count !set)
 
-let bench_transient_add_50k_plus_10k () =
-  let builder = transient (Lazy.force set_50k) in
-  for i = 0 to 9_999 do
-    add_transient (50_000 + i) builder
-  done;
-  builder |> persistent |> count |> consume_int
-
-let bench_transient_single_add_50k () =
-  let builder = transient (Lazy.force set_50k) in
-  add_transient 50_000 builder;
-  builder |> persistent |> count |> consume_int
-
-let bench_transient_leaf_add_1k () =
-  let settings = { branching_factor = 4_096 } in
-  let original =
-    of_sorted_array_by ~settings ~cmp:compare (Array.init 2_048 Fun.id)
-  in
-  let builder = transient original in
-  for value = 2_048 to 3_071 do
-    add_transient value builder
-  done;
-  builder |> persistent |> count |> consume_int
-
 let bench_disj_10k () =
   let set = ref (Lazy.force set_10k) in
   for i = 0 to Array.length ints_10k - 1 do
@@ -259,12 +230,15 @@ let bench_disj_10k () =
   done;
   consume_int (count !set)
 
-let bench_transient_remove_10k () =
-  let builder = transient (Lazy.force set_10k) in
-  for i = 0 to Array.length ints_10k - 1 do
-    remove_transient ints_10k.(i) builder
+let bench_remove_single_50k () =
+  Lazy.force set_50k |> remove 25_000 |> count |> consume_int
+
+let bench_remove_10_50k () =
+  let set = ref (Lazy.force set_50k) in
+  for i = 0 to 9 do
+    set := remove ints_10k.(i) !set
   done;
-  builder |> persistent |> count |> consume_int
+  consume_int (count !set)
 
 let bench_remove_50k_minus_10k () =
   let set = ref (Lazy.force set_50k) in
@@ -272,18 +246,6 @@ let bench_remove_50k_minus_10k () =
     set := remove ints_10k.(i) !set
   done;
   consume_int (count !set)
-
-let bench_transient_remove_50k_minus_10k () =
-  let builder = transient (Lazy.force set_50k) in
-  for i = 0 to Array.length ints_10k - 1 do
-    remove_transient ints_10k.(i) builder
-  done;
-  builder |> persistent |> count |> consume_int
-
-let bench_transient_single_remove_50k () =
-  let builder = transient (Lazy.force set_50k) in
-  remove_transient 25_000 builder;
-  builder |> persistent |> count |> consume_int
 
 let bench_contains_10k () =
   let set = Lazy.force set_10k in
@@ -437,17 +399,13 @@ let benches =
     ("of-list-by-desc-50K", bench_of_list_by_desc_50k);
     ("of-sorted-array-50K", bench_of_sorted_array_50k);
     ("conj-10K", bench_conj_10k);
-    ("transient-create-300K", bench_transient_create_300k);
-    ("transient-add-10K", bench_transient_add_10k);
+    ("add-single-50K", bench_add_single_50k);
+    ("add-10-50K", bench_add_10_50k);
     ("add-50K-plus-10K", bench_add_50k_plus_10k);
-    ("transient-add-50K-plus-10K", bench_transient_add_50k_plus_10k);
-    ("transient-single-add-50K", bench_transient_single_add_50k);
-    ("transient-leaf-add-1K", bench_transient_leaf_add_1k);
     ("disj-10K", bench_disj_10k);
-    ("transient-remove-10K", bench_transient_remove_10k);
+    ("remove-single-50K", bench_remove_single_50k);
+    ("remove-10-50K", bench_remove_10_50k);
     ("remove-50K-minus-10K", bench_remove_50k_minus_10k);
-    ("transient-remove-50K-minus-10K", bench_transient_remove_50k_minus_10k);
-    ("transient-single-remove-50K", bench_transient_single_remove_50k);
     ("contains-10K", bench_contains_10k);
     ("count-300K", bench_count_300k);
     ("to-list-300K", bench_to_list_300k);

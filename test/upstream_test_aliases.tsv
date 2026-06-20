@@ -4,7 +4,6 @@
 core.cljc	semantic-test-btset-by	test_pair_comparator_nil_wildcard_slices
 core.cljc	test-slice	test_upstream_fractional_slice_boundaries
 core.cljc	test-reduces	test_fold_reduces_sets_and_sequences
-core.cljc	iter-over-transient	-
 core.cljc	seek-for-seq-test	test_slice_sequences_are_seekable_and_reversible
 small.cljc	test-small	test_sorted_order_and_uniqueness
 stress.cljc	stresstest-btset	test_upstream_stresstest_btset_parity

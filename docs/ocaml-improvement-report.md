@@ -215,7 +215,7 @@ Expected result:
 
 ### 7. Add a Mutable Builder
 
-OCaml does not need Clojure transients, but a builder is useful and idiomatic:
+A dedicated builder can still be useful and idiomatic for bulk construction:
 
 ```ocaml
 module Builder : sig
@@ -232,7 +232,7 @@ mutable B+ tree if profiling later justifies it.
 Expected result:
 
 - Faster large index construction.
-- Clearer API than exposing transient-style mutation on the set itself.
+- Clearer API than exposing mutation on the set itself.
 
 ### 8. Optimize Range Scans Inside Leaves
 
