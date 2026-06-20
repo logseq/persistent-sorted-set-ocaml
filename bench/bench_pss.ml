@@ -15,7 +15,13 @@ let default_names =
     "of-list-by-desc-50K";
     "of-sorted-array-50K";
     "conj-10K";
+    "transient-create-300K";
+    "transient-add-10K";
+    "transient-single-add-50K";
+    "transient-leaf-add-1K";
     "disj-10K";
+    "transient-remove-10K";
+    "transient-single-remove-50K";
     "contains-10K";
     "count-300K";
     "to-list-300K";
@@ -35,8 +41,13 @@ let default_names =
     "seek-300K";
     "store-10K";
     "restore-10K";
+    "restored-contains-10K";
+    "stored-ref-repeat-contains-10K";
     "restored-to-list-10K";
+    "restored-wide-rslice-1";
     "restored-chained-add-10K";
+    "stored-underfull-remove-4K";
+    "stored-nested-underfull-remove-4K";
   ]
 
 let default_config =
@@ -94,6 +105,7 @@ let ints_50k = shuffled_array 50_000
 let ints_50k_list = Array.to_list ints_50k
 let sorted_50k = Array.init 50_000 Fun.id
 let set_10k = lazy (of_sorted_array (Array.init 10_000 Fun.id))
+let set_50k = lazy (of_sorted_array sorted_50k)
 let set_300k = lazy (of_sorted_array (Array.init 300_000 Fun.id))
 let list_300k = lazy (Array.to_list (Array.init 300_000 Fun.id))
 let blackhole = ref 0
@@ -122,6 +134,51 @@ let restored_10k =
      in
      (root, storage))
 
+let restored_wide_4096 =
+  lazy
+    (let memory = Hashtbl.create 4097 in
+     let keys = Array.to_list (Array.init 4_096 Fun.id) in
+     let child_addresses =
+       List.map
+         (fun value ->
+           let address = "leaf-" ^ string_of_int value in
+           Hashtbl.add memory address (Leaf [ value ]);
+           address)
+         keys
+     in
+     Hashtbl.add memory "root" (Branch (keys, child_addresses));
+     let storage =
+       {
+         store_node =
+           (fun _ -> invalid_arg "wide benchmark storage is read-only");
+         restore_node = (fun address -> Hashtbl.find_opt memory address);
+         accessed = (fun _ -> ());
+       }
+     in
+     storage)
+
+let stored_underfull_4k =
+  lazy
+    (let storage = build_storage () in
+     let settings = { branching_factor = 64 } in
+     let _, stored =
+       store
+         (of_sorted_array_by ~storage ~settings ~cmp:compare
+            (Array.init 4_096 Fun.id))
+     in
+     stored)
+
+let stored_nested_underfull_4k =
+  lazy
+    (let storage = build_storage () in
+     let settings = { branching_factor = 8 } in
+     let _, stored =
+       store
+         (of_sorted_array_by ~storage ~settings ~cmp:compare
+            (Array.init 4_096 Fun.id))
+     in
+     stored)
+
 let bench_empty_1m () =
   let total = ref 0 in
   for _ = 1 to 1_000_000 do
@@ -149,12 +206,52 @@ let bench_conj_10k () =
   done;
   consume_int (count !set)
 
+let bench_transient_create_300k () =
+  let builder = transient (Lazy.force set_300k) in
+  ignore (Sys.opaque_identity builder);
+  consume_int 1
+
+let bench_transient_add_10k () =
+  let builder = transient (empty ()) in
+  for i = 0 to Array.length ints_10k - 1 do
+    add_transient ints_10k.(i) builder
+  done;
+  builder |> persistent |> count |> consume_int
+
+let bench_transient_single_add_50k () =
+  let builder = transient (Lazy.force set_50k) in
+  add_transient 50_000 builder;
+  builder |> persistent |> count |> consume_int
+
+let bench_transient_leaf_add_1k () =
+  let settings = { branching_factor = 4_096 } in
+  let original =
+    of_sorted_array_by ~settings ~cmp:compare (Array.init 2_048 Fun.id)
+  in
+  let builder = transient original in
+  for value = 2_048 to 3_071 do
+    add_transient value builder
+  done;
+  builder |> persistent |> count |> consume_int
+
 let bench_disj_10k () =
   let set = ref (Lazy.force set_10k) in
   for i = 0 to Array.length ints_10k - 1 do
     set := remove ints_10k.(i) !set
   done;
   consume_int (count !set)
+
+let bench_transient_remove_10k () =
+  let builder = transient (Lazy.force set_10k) in
+  for i = 0 to Array.length ints_10k - 1 do
+    remove_transient ints_10k.(i) builder
+  done;
+  builder |> persistent |> count |> consume_int
+
+let bench_transient_single_remove_50k () =
+  let builder = transient (Lazy.force set_50k) in
+  remove_transient 25_000 builder;
+  builder |> persistent |> count |> consume_int
 
 let bench_contains_10k () =
   let set = Lazy.force set_10k in
@@ -242,11 +339,41 @@ let bench_restore_10k () =
   | Some restored ->
       settings restored |> fun settings -> consume_int settings.branching_factor
 
+let bench_restored_contains_10k () =
+  let restored_10k_root, restored_10k_storage = Lazy.force restored_10k in
+  match restore ~cmp:compare restored_10k_storage restored_10k_root with
+  | None -> invalid_arg "restored benchmark root missing"
+  | Some restored ->
+      let found = ref 0 in
+      for i = 0 to Array.length ints_10k - 1 do
+        if mem ints_10k.(i) restored then incr found
+      done;
+      consume_int !found
+
+let bench_stored_ref_repeat_contains_10k () =
+  let restored_10k_root, restored_10k_storage = Lazy.force restored_10k in
+  match restore ~cmp:compare restored_10k_storage restored_10k_root with
+  | None -> invalid_arg "restored benchmark root missing"
+  | Some restored ->
+      let modified = add 10_000 restored in
+      let found = ref 0 in
+      for i = 0 to Array.length ints_10k - 1 do
+        if mem (ints_10k.(i) mod 32) modified then incr found
+      done;
+      consume_int !found
+
 let bench_restored_to_list_10k () =
   let restored_10k_root, restored_10k_storage = Lazy.force restored_10k in
   match restore ~cmp:compare restored_10k_storage restored_10k_root with
   | None -> invalid_arg "restored benchmark root missing"
   | Some restored -> restored |> to_list |> List.length |> consume_int
+
+let bench_restored_wide_rslice_1 () =
+  let storage = Lazy.force restored_wide_4096 in
+  match restore ~cmp:compare storage "root" with
+  | None -> invalid_arg "wide restored benchmark root missing"
+  | Some restored ->
+      restored |> rslice ~from_:4095 ~to_:4095 |> List.length |> consume_int
 
 let bench_restored_chained_add_10k () =
   let restored_10k_root, restored_10k_storage = Lazy.force restored_10k in
@@ -256,6 +383,20 @@ let bench_restored_chained_add_10k () =
       restored |> add 10_000 |> add 10_001 |> add 10_001 |> store |> fst
       |> String.length |> consume_int
 
+let bench_stored_underfull_remove_4k () =
+  let set = ref (Lazy.force stored_underfull_4k) in
+  for value = 0 to 3_071 do
+    set := remove value !set
+  done;
+  consume_int (count !set)
+
+let bench_stored_nested_underfull_remove_4k () =
+  let set = ref (Lazy.force stored_nested_underfull_4k) in
+  for value = 0 to 399 do
+    set := remove value !set
+  done;
+  consume_int (count !set)
+
 let benches =
   [
     ("empty-1M", bench_empty_1m);
@@ -264,7 +405,13 @@ let benches =
     ("of-list-by-desc-50K", bench_of_list_by_desc_50k);
     ("of-sorted-array-50K", bench_of_sorted_array_50k);
     ("conj-10K", bench_conj_10k);
+    ("transient-create-300K", bench_transient_create_300k);
+    ("transient-add-10K", bench_transient_add_10k);
+    ("transient-single-add-50K", bench_transient_single_add_50k);
+    ("transient-leaf-add-1K", bench_transient_leaf_add_1k);
     ("disj-10K", bench_disj_10k);
+    ("transient-remove-10K", bench_transient_remove_10k);
+    ("transient-single-remove-50K", bench_transient_single_remove_50k);
     ("contains-10K", bench_contains_10k);
     ("count-300K", bench_count_300k);
     ("to-list-300K", bench_to_list_300k);
@@ -284,8 +431,14 @@ let benches =
     ("seek-300K", bench_seek_300k);
     ("store-10K", bench_store_10k);
     ("restore-10K", bench_restore_10k);
+    ("restored-contains-10K", bench_restored_contains_10k);
+    ("stored-ref-repeat-contains-10K", bench_stored_ref_repeat_contains_10k);
     ("restored-to-list-10K", bench_restored_to_list_10k);
+    ("restored-wide-rslice-1", bench_restored_wide_rslice_1);
     ("restored-chained-add-10K", bench_restored_chained_add_10k);
+    ("stored-underfull-remove-4K", bench_stored_underfull_remove_4k);
+    ( "stored-nested-underfull-remove-4K",
+      bench_stored_nested_underfull_remove_4k );
   ]
 
 let run_for duration_ms f =

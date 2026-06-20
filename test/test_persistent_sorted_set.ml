@@ -1,6 +1,40 @@
 open Persistent_sorted_set
+module Pss = Persistent_sorted_set
 
 let failf fmt = Printf.ksprintf failwith fmt
+
+let validate_set set =
+  Pss.validate_invariants set;
+  set
+
+let empty () = Pss.empty () |> validate_set
+
+let empty_by ?settings ?storage ?cmp () =
+  Pss.empty_by ?settings ?storage ?cmp () |> validate_set
+
+let of_list values = Pss.of_list values |> validate_set
+
+let of_list_by ?settings ?storage ?cmp values =
+  Pss.of_list_by ?settings ?storage ?cmp values |> validate_set
+
+let of_sorted_array values = Pss.of_sorted_array values |> validate_set
+
+let of_sorted_array_by ?settings ?storage ?cmp values =
+  Pss.of_sorted_array_by ?settings ?storage ?cmp values |> validate_set
+
+let add value set = Pss.add value set |> validate_set
+let remove value set = Pss.remove value set |> validate_set
+let persistent builder = Pss.persistent builder |> validate_set
+
+let store set =
+  Pss.validate_invariants set;
+  let address, stored = Pss.store set in
+  (address, validate_set stored)
+
+let restore ?cmp ?settings storage address =
+  match Pss.restore ?cmp ?settings storage address with
+  | None -> None
+  | Some set -> Some (validate_set set)
 
 let assert_equal_list label expected actual =
   if expected <> actual then failf "%s: unexpected list" label
@@ -907,6 +941,43 @@ let test_storage_round_trip_and_stable_addresses () =
     failwith "adding an existing value should keep the stored root";
   assert_equal_int "unchanged duplicate add does not write again" 2 !writes
 
+let test_stored_count_uses_cached_size () =
+  let memory = Hashtbl.create 16 in
+  let reads = ref 0 in
+  let accessed = ref [] in
+  let writes = ref 0 in
+  let storage =
+    {
+      store_node =
+        (fun node ->
+          incr writes;
+          let address = "node-" ^ string_of_int !writes in
+          Hashtbl.replace memory address node;
+          address);
+      restore_node =
+        (fun address ->
+          incr reads;
+          Hashtbl.find_opt memory address);
+      accessed = (fun address -> accessed := address :: !accessed);
+    }
+  in
+  let _, stored = store (of_list_by ~storage ~cmp:compare (irange 0 100)) in
+  reads := 0;
+  accessed := [];
+  assert_equal_int "stored count returns the cached set size" 101 (count stored);
+  assert_equal_int "stored count should not restore stored nodes" 0 !reads;
+  assert_equal_list "stored count should not mark stored nodes accessed" []
+    !accessed;
+  let removed = remove 50 stored in
+  reads := 0;
+  accessed := [];
+  assert_equal_int "edited stored count updates the cached set size" 100
+    (count removed);
+  assert_equal_int "edited stored count should not restore stored nodes" 0
+    !reads;
+  assert_equal_list "edited stored count should not mark stored nodes accessed"
+    [] !accessed
+
 let test_storage_uses_leaf_and_branch_nodes_for_large_sets () =
   let memory = Hashtbl.create 16 in
   let writes = ref 0 in
@@ -1015,6 +1086,86 @@ let test_storage_remove_preserves_unchanged_leaf_addresses () =
     (irange 0 49 @ irange 51 100)
     (to_list removed_stored)
 
+let test_storage_remove_borrows_from_right_sibling () =
+  let memory = Hashtbl.create 16 in
+  let writes = ref 0 in
+  let storage =
+    {
+      store_node =
+        (fun node ->
+          incr writes;
+          let address = "node-" ^ string_of_int !writes in
+          Hashtbl.replace memory address node;
+          address);
+      restore_node = (fun address -> Hashtbl.find_opt memory address);
+      accessed = (fun _ -> ());
+    }
+  in
+  let settings = { branching_factor = 4 } in
+  let _, stored =
+    store (of_list_by ~storage ~settings ~cmp:compare (irange 0 7))
+  in
+  let rebalanced = stored |> remove 0 |> remove 1 |> remove 2 in
+  let rebalanced_root, rebalanced_stored = store rebalanced in
+  assert_equal_list "rebalanced remove keeps sorted values" (irange 3 7)
+    (to_list rebalanced_stored);
+  match Hashtbl.find_opt memory rebalanced_root with
+  | Some (Branch (_, [ left_address; right_address ])) -> (
+      match
+        ( Hashtbl.find_opt memory left_address,
+          Hashtbl.find_opt memory right_address )
+      with
+      | Some (Leaf left), Some (Leaf right) ->
+          assert_equal_list "underfull left leaf borrows from right sibling"
+            [ 3; 4 ] left;
+          assert_equal_list "right sibling keeps the remaining upper values"
+            [ 5; 6; 7 ] right
+      | _ -> failwith "rebalanced children should be leaves")
+  | Some _ -> failwith "rebalanced root should keep two leaf children"
+  | None -> failwith "rebalanced root should be stored"
+
+let test_nested_storage_remove_borrows_branch_from_right_sibling () =
+  let memory = Hashtbl.create 128 in
+  let writes = ref 0 in
+  let storage =
+    {
+      store_node =
+        (fun node ->
+          incr writes;
+          let address = "node-" ^ string_of_int !writes in
+          Hashtbl.replace memory address node;
+          address);
+      restore_node = (fun address -> Hashtbl.find_opt memory address);
+      accessed = (fun _ -> ());
+    }
+  in
+  let settings = { branching_factor = 4 } in
+  let _, stored =
+    store (of_list_by ~storage ~settings ~cmp:compare (irange 0 63))
+  in
+  let rebalanced =
+    List.fold_left (fun set value -> remove value set) stored (irange 0 11)
+  in
+  let rebalanced_root, rebalanced_stored = store rebalanced in
+  assert_equal_list "nested rebalanced remove keeps sorted values"
+    (irange 12 63)
+    (to_list rebalanced_stored);
+  match Hashtbl.find_opt memory rebalanced_root with
+  | Some (Branch (_, first_branch :: second_branch :: _)) -> (
+      match
+        ( Hashtbl.find_opt memory first_branch,
+          Hashtbl.find_opt memory second_branch )
+      with
+      | Some (Branch (first_keys, _)), Some (Branch (second_keys, _)) ->
+          assert_equal_int
+            "underfull branch borrows one child from right sibling" 2
+            (List.length first_keys);
+          assert_equal_int "right branch keeps the remaining children" 3
+            (List.length second_keys)
+      | _ -> failwith "rebalanced root children should be branches")
+  | Some _ -> failwith "nested rebalanced root should be a branch"
+  | None -> failwith "nested rebalanced root should be stored"
+
 let test_storage_add_preserves_unchanged_leaf_addresses () =
   let memory = Hashtbl.create 16 in
   let writes = ref 0 in
@@ -1063,6 +1214,163 @@ let test_storage_add_preserves_unchanged_leaf_addresses () =
   assert_equal_list "added stored set keeps sorted values" (irange 0 100)
     (to_list added_stored)
 
+let test_transient_batches_adds_and_removes () =
+  let original = of_list_by ~cmp:compare [ 0; 1; 2; 3; 4; 5 ] in
+  let builder = transient original in
+  add_transient 6 builder;
+  add_transient 3 builder;
+  add_transient 7 builder;
+  remove_transient 1 builder;
+  remove_transient 4 builder;
+  remove_transient 42 builder;
+  assert_equal_list "transient edits do not mutate the persistent source"
+    [ 0; 1; 2; 3; 4; 5 ] (to_list original);
+  let changed = persistent builder in
+  assert_equal_list "persistent freezes batched transient edits"
+    [ 0; 2; 3; 5; 6; 7 ] (to_list changed);
+  assert_equal_int "persistent transient result maintains count" 6
+    (count changed);
+  assert_raises_invalid_arg "frozen transient rejects later adds" (fun () ->
+      add_transient 8 builder);
+  assert_raises_invalid_arg "frozen transient rejects later removes" (fun () ->
+      remove_transient 0 builder);
+  assert_raises_invalid_arg "frozen transient rejects double persistent"
+    (fun () -> ignore (persistent builder))
+
+let test_transient_matches_sequential_comparator_representatives () =
+  let cmp = quotient_compare 10 in
+  let builder = transient (empty_by ~cmp ()) in
+  add_transient 21 builder;
+  add_transient 25 builder;
+  add_transient 14 builder;
+  add_transient 17 builder;
+  remove_transient 20 builder;
+  add_transient 29 builder;
+  add_transient 28 builder;
+  assert_equal_list
+    "transient keeps the first comparator representative until removal"
+    [ 14; 29 ]
+    (to_list (persistent builder));
+  let sequential =
+    empty_by ~cmp () |> add 21 |> add 25 |> add 14 |> add 17 |> remove 20
+    |> add 29 |> add 28
+  in
+  assert_equal_list "transient matches sequential comparator semantics"
+    (to_list sequential) [ 14; 29 ]
+
+let test_empty_transient_add_bulk_builds_without_chained_updates () =
+  let values = shuffled_array 50_000 in
+  let values_list = Array.to_list values in
+  let bulk_time = best_time 3 (fun () -> of_list_by ~cmp:compare values_list) in
+  let transient_time =
+    best_time 3 (fun () ->
+        let builder = transient (empty_by ~cmp:compare ()) in
+        Array.iter (fun value -> add_transient value builder) values;
+        Pss.persistent builder)
+  in
+  if transient_time > bulk_time *. 1.35 then
+    failf
+      "empty transient add should bulk-build near of_list_by: bulk %.4fs, \
+       transient %.4fs"
+      bulk_time transient_time;
+  let builder = transient (empty_by ~cmp:compare ()) in
+  Array.iter (fun value -> add_transient value builder) values;
+  ignore (validate_set (Pss.persistent builder))
+
+let test_transient_single_add_avoids_full_tree_merge () =
+  let comparisons = ref 0 in
+  let cmp left right =
+    incr comparisons;
+    compare left right
+  in
+  let original = of_sorted_array_by ~cmp (Array.init 50_000 Fun.id) in
+  comparisons := 0;
+  let builder = transient original in
+  add_transient 50_000 builder;
+  let changed = Pss.persistent builder in
+  if !comparisons > 200 then
+    failf
+      "single transient add should edit by path instead of merging the full \
+       tree: %d comparisons"
+      !comparisons;
+  let changed = validate_set changed in
+  assert_equal_list "single transient add keeps the source persistent"
+    (irange 0 49_999) (to_list original);
+  assert_equal_int "single transient add updates count" 50_001 (count changed);
+  if not (mem 50_000 changed) then
+    failwith "single transient add should add the new value"
+
+let test_transient_creation_does_not_clone_large_tree () =
+  let original = of_sorted_array_by ~cmp:compare (Array.init 300_000 Fun.id) in
+  Gc.compact ();
+  let before = Gc.allocated_bytes () in
+  let builder = transient original in
+  let after = Gc.allocated_bytes () in
+  ignore (Sys.opaque_identity builder);
+  let allocated = after -. before in
+  if allocated > 100_000. then
+    failf "transient creation should not clone the full tree: %.0f bytes"
+      allocated
+
+let test_transient_repeated_leaf_adds_reuse_leaf_capacity () =
+  let settings = { branching_factor = 4_096 } in
+  let original =
+    of_sorted_array_by ~settings ~cmp:compare (Array.init 2_048 Fun.id)
+  in
+  let builder = transient original in
+  Gc.compact ();
+  let before = Gc.allocated_bytes () in
+  for value = 2_048 to 3_071 do
+    add_transient value builder
+  done;
+  let changed = Pss.persistent builder in
+  let after = Gc.allocated_bytes () in
+  let allocated = after -. before in
+  if allocated > 5_000_000. then
+    failf "repeated transient leaf adds should reuse leaf capacity: %.0f bytes"
+      allocated;
+  let changed = validate_set changed in
+  assert_equal_int "repeated transient leaf adds update count" 3_072
+    (count changed);
+  assert_equal_list "repeated transient leaf adds keep source persistent"
+    (irange 0 2_047) (to_list original)
+
+let test_transient_single_remove_avoids_full_tree_merge () =
+  let comparisons = ref 0 in
+  let cmp left right =
+    incr comparisons;
+    compare left right
+  in
+  let original = of_sorted_array_by ~cmp (Array.init 50_000 Fun.id) in
+  comparisons := 0;
+  let builder = transient original in
+  remove_transient 25_000 builder;
+  let changed = Pss.persistent builder in
+  if !comparisons > 200 then
+    failf
+      "single transient remove should edit by path instead of merging the full \
+       tree: %d comparisons"
+      !comparisons;
+  let changed = validate_set changed in
+  assert_equal_int "single transient remove keeps the source count" 50_000
+    (count original);
+  assert_equal_int "single transient remove updates count" 49_999
+    (count changed);
+  if mem 25_000 changed then
+    failwith "single transient remove should remove the target value"
+
+let test_transient_can_add_after_removing_all_values () =
+  let original = of_list_by ~cmp:compare [ 1; 2; 3 ] in
+  let builder = transient original in
+  remove_transient 1 builder;
+  remove_transient 2 builder;
+  remove_transient 3 builder;
+  add_transient 4 builder;
+  assert_equal_list "transient add after clearing keeps the source persistent"
+    [ 1; 2; 3 ] (to_list original);
+  assert_equal_list "transient add after clearing creates a new singleton" [ 4 ]
+    (to_list (persistent builder))
+
 let test_restored_add_preserves_unchanged_leaf_addresses_lazily () =
   let memory = Hashtbl.create 16 in
   let writes = ref 0 in
@@ -1105,6 +1413,45 @@ let test_restored_add_preserves_unchanged_leaf_addresses_lazily () =
     (stored_addresses memory appended_root);
   assert_equal_list "restored add keeps sorted values" (irange 0 101)
     (to_list appended_stored)
+
+let test_restored_transient_add_reads_only_edit_path () =
+  let memory = Hashtbl.create 16 in
+  let writes = ref 0 in
+  let reads = ref 0 in
+  let accessed = ref [] in
+  let storage =
+    {
+      store_node =
+        (fun node ->
+          incr writes;
+          let address = "node-" ^ string_of_int !writes in
+          Hashtbl.replace memory address node;
+          address);
+      restore_node =
+        (fun address ->
+          incr reads;
+          Hashtbl.find_opt memory address);
+      accessed = (fun address -> accessed := address :: !accessed);
+    }
+  in
+  let root, _ = store (of_list_by ~storage ~cmp:compare (irange 0 100)) in
+  reads := 0;
+  accessed := [];
+  let restored =
+    match restore ~cmp:compare storage root with
+    | Some restored -> restored
+    | None -> failwith "restore should find the stored root"
+  in
+  let builder = transient restored in
+  add_transient 101 builder;
+  let appended = Pss.persistent builder in
+  assert_equal_int "restored transient add reads only root and target leaf" 2
+    !reads;
+  assert_equal_list "restored transient add accesses only root and target leaf"
+    [ "node-4"; root ] !accessed;
+  let appended = validate_set appended in
+  assert_equal_list "restored transient add keeps sorted values" (irange 0 101)
+    (to_list appended)
 
 let test_chained_restored_adds_keep_edit_path_without_rebuilding () =
   let memory = Hashtbl.create 16 in
@@ -1261,6 +1608,84 @@ let test_restored_mem_reads_only_needed_leaves () =
   assert_equal_list "restored mem lower miss should access root and first leaf"
     [ "node-1"; root ] !accessed
 
+let test_restored_tree_refs_cache_repeated_access () =
+  let memory = Hashtbl.create 16 in
+  let writes = ref 0 in
+  let reads = ref 0 in
+  let accessed = ref [] in
+  let storage =
+    {
+      store_node =
+        (fun node ->
+          incr writes;
+          let address = "node-" ^ string_of_int !writes in
+          Hashtbl.replace memory address node;
+          address);
+      restore_node =
+        (fun address ->
+          incr reads;
+          Hashtbl.find_opt memory address);
+      accessed = (fun address -> accessed := address :: !accessed);
+    }
+  in
+  let root, _ = store (of_list_by ~storage ~cmp:compare (irange 0 100)) in
+  let restored =
+    match restore ~cmp:compare storage root with
+    | Some restored -> restored
+    | None -> failwith "restore should find the stored root"
+  in
+  let appended = add 101 restored in
+  reads := 0;
+  accessed := [];
+  if not (mem 5 appended) then failwith "mem should find cached ref values";
+  assert_equal_int "first ref mem restores the unchanged leaf once" 1 !reads;
+  assert_equal_list "first ref mem accesses the unchanged leaf" [ "node-1" ]
+    !accessed;
+  reads := 0;
+  accessed := [];
+  if not (mem 5 appended) then
+    failwith "mem should find values from cached refs";
+  assert_equal_int "second ref mem should reuse the cached leaf" 0 !reads;
+  assert_equal_list "second ref mem should not access storage" [] !accessed
+
+let test_restored_mem_uses_binary_search_inside_stored_nodes () =
+  let memory = Hashtbl.create 128 in
+  let writes = ref 0 in
+  let comparisons = ref 0 in
+  let cmp left right =
+    incr comparisons;
+    compare left right
+  in
+  let storage =
+    {
+      store_node =
+        (fun node ->
+          incr writes;
+          let address = "node-" ^ string_of_int !writes in
+          Hashtbl.replace memory address node;
+          address);
+      restore_node = (fun address -> Hashtbl.find_opt memory address);
+      accessed = (fun _ -> ());
+    }
+  in
+  let settings = { branching_factor = 64 } in
+  let root, _ =
+    store (of_sorted_array_by ~storage ~settings ~cmp (Array.init 4_096 Fun.id))
+  in
+  comparisons := 0;
+  let restored =
+    match restore ~settings ~cmp storage root with
+    | Some restored -> restored
+    | None -> failwith "restore should find the stored root"
+  in
+  if not (mem 4_095 restored) then
+    failwith "mem should find the final value in a restored set";
+  if !comparisons > 40 then
+    failf
+      "restored mem should binary-search stored branch keys and leaf values: \
+       %d comparisons"
+      !comparisons
+
 let test_restored_slice_reads_only_overlapping_leaves () =
   let memory = Hashtbl.create 16 in
   let writes = ref 0 in
@@ -1354,6 +1779,41 @@ let test_restored_reverse_slice_reads_only_overlapping_leaves () =
     "restored reverse slice across boundary should access root and two leaves"
     [ "node-2"; "node-3"; root ]
     !accessed
+
+let test_restored_reverse_slice_avoids_branch_annotation_list () =
+  let memory = Hashtbl.create 4097 in
+  let keys = irange 0 4095 in
+  let child_addresses =
+    List.map
+      (fun value ->
+        let address = "leaf-" ^ string_of_int value in
+        Hashtbl.add memory address (Leaf [ value ]);
+        address)
+      keys
+  in
+  Hashtbl.add memory "root" (Branch (keys, child_addresses));
+  let storage =
+    {
+      store_node = (fun _ -> invalid_arg "test storage is read-only");
+      restore_node = (fun address -> Hashtbl.find_opt memory address);
+      accessed = (fun _ -> ());
+    }
+  in
+  let restored =
+    match restore ~cmp:compare storage "root" with
+    | Some restored -> restored
+    | None -> failwith "restore should find the wide stored root"
+  in
+  Gc.compact ();
+  let before = Gc.allocated_bytes () in
+  assert_equal_list "wide restored reverse slice returns the final value"
+    [ 4095 ]
+    (rslice ~from_:4095 ~to_:4095 restored);
+  let after = Gc.allocated_bytes () in
+  let allocated = after -. before in
+  if allocated > 120_000. then
+    failf "reverse deferred slice should not annotate every branch child: %.0f"
+      allocated
 
 let test_restored_seq_seek_is_lazy () =
   let memory = Hashtbl.create 16 in
@@ -1837,15 +2297,30 @@ let () =
   test_upstream_stresstest_seek_parity ();
   test_upstream_overflow_batched_insert_smoke ();
   test_storage_round_trip_and_stable_addresses ();
+  test_stored_count_uses_cached_size ();
   test_storage_uses_leaf_and_branch_nodes_for_large_sets ();
   test_storage_remove_preserves_unchanged_leaf_addresses ();
+  test_storage_remove_borrows_from_right_sibling ();
+  test_nested_storage_remove_borrows_branch_from_right_sibling ();
   test_storage_add_preserves_unchanged_leaf_addresses ();
+  test_transient_batches_adds_and_removes ();
+  test_transient_matches_sequential_comparator_representatives ();
+  test_empty_transient_add_bulk_builds_without_chained_updates ();
+  test_transient_single_add_avoids_full_tree_merge ();
+  test_transient_creation_does_not_clone_large_tree ();
+  test_transient_repeated_leaf_adds_reuse_leaf_capacity ();
+  test_transient_single_remove_avoids_full_tree_merge ();
+  test_transient_can_add_after_removing_all_values ();
   test_restored_add_preserves_unchanged_leaf_addresses_lazily ();
+  test_restored_transient_add_reads_only_edit_path ();
   test_chained_restored_adds_keep_edit_path_without_rebuilding ();
   test_restored_remove_preserves_unchanged_leaf_addresses_lazily ();
   test_restored_mem_reads_only_needed_leaves ();
+  test_restored_tree_refs_cache_repeated_access ();
+  test_restored_mem_uses_binary_search_inside_stored_nodes ();
   test_restored_slice_reads_only_overlapping_leaves ();
   test_restored_reverse_slice_reads_only_overlapping_leaves ();
+  test_restored_reverse_slice_avoids_branch_annotation_list ();
   test_restored_seq_seek_is_lazy ();
   test_restored_rseq_seek_is_lazy ();
   test_restored_slice_seq_construction_is_lazy ();

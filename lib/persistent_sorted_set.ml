@@ -10,11 +10,17 @@ type 'a storage = {
 
 module Node = struct
   type 'a t =
-    | Ref of { max_key : 'a; address : string }
-    | Leaf of { values : 'a array; address : string option }
+    | Ref of { max_key : 'a; address : string; mutable cached : 'a t option }
+    | Leaf of {
+        mutable values : 'a array;
+        mutable len : int;
+        mutable owner : int option;
+        address : string option;
+      }
     | Branch of {
-        keys : 'a array;
-        children : 'a t array;
+        mutable keys : 'a array;
+        mutable children : 'a t array;
+        mutable owner : int option;
         address : string option;
       }
 end
@@ -31,12 +37,23 @@ type 'a t = {
   set_settings : settings;
   set_storage : 'a storage option;
   data : 'a data;
+  count_cache : int option;
+}
+
+type 'a transient_op = Add_transient of 'a | Remove_transient of 'a
+
+type 'a transient = {
+  base : 'a t;
+  mutable operations : 'a transient_op list;
+  mutable working : 'a t option;
+  owner : int;
+  mutable active : bool;
 }
 
 type direction = Asc | Desc
 
 type 'a seq_source =
-  | Seq_values of 'a list
+  | Seq_empty
   | Seq_tree of { storage : 'a storage option; root : 'a node }
   | Seq_deferred of { storage : 'a storage; address : string }
 
@@ -62,7 +79,13 @@ let validate_settings settings =
 let settings set = set.set_settings
 
 let empty_with_cmp ?storage settings cmp =
-  { cmp; set_settings = settings; set_storage = storage; data = Empty }
+  {
+    cmp;
+    set_settings = settings;
+    set_storage = storage;
+    data = Empty;
+    count_cache = Some 0;
+  }
 
 let empty_by ?(settings = default_settings) ?storage ?(cmp = default_cmp) () =
   let settings = validate_settings settings in
@@ -86,10 +109,19 @@ let chunks size values =
   in
   loop [] values
 
-let prepend_array values init =
+let prepend_array_prefix values len init =
   let acc = ref init in
-  for i = Array.length values - 1 downto 0 do
+  for i = len - 1 downto 0 do
     acc := values.(i) :: !acc
+  done;
+  !acc
+
+let array_prefix_to_list values len = prepend_array_prefix values len []
+
+let fold_array_prefix f init values len =
+  let acc = ref init in
+  for i = 0 to len - 1 do
+    acc := f !acc values.(i)
   done;
   !acc
 
@@ -123,7 +155,7 @@ let rec materialize_node_into storage node acc =
   | Node.Ref { address; _ } ->
       materialize_address_with (storage_required storage) address (fun () ->
           acc)
-  | Node.Leaf { values; _ } -> prepend_array values acc
+  | Node.Leaf { values; len; _ } -> prepend_array_prefix values len acc
   | Node.Branch { children; _ } ->
       let acc = ref acc in
       for i = Array.length children - 1 downto 0 do
@@ -165,6 +197,7 @@ let node_branch_of_refs refs =
     {
       keys = Array.of_list keys;
       children = Array.of_list children;
+      owner = None;
       address = None;
     }
 
@@ -172,7 +205,9 @@ let node_leaf_refs_of_chunks chunks =
   chunks
   |> List.map (fun chunk ->
       let values = Array.of_list chunk in
-      (values.(Array.length values - 1), Node.Leaf { values; address = None }))
+      ( values.(Array.length values - 1),
+        Node.Leaf
+          { values; len = Array.length values; owner = None; address = None } ))
 
 let rec node_of_refs settings = function
   | [] -> None
@@ -201,22 +236,20 @@ type 'a tree_edit_result =
   | Tree_edit_unchanged
   | Tree_edit_changed of ('a * 'a node) list
 
-let array_insert values index value =
-  let length = Array.length values in
-  let result = Array.make (length + 1) value in
+let array_insert_len values len index value =
+  let result = Array.make (len + 1) value in
   Array.blit values 0 result 0 index;
   result.(index) <- value;
-  Array.blit values index result (index + 1) (length - index);
+  Array.blit values index result (index + 1) (len - index);
   result
 
-let array_remove values index =
-  let length = Array.length values in
-  if length = 1 then [||]
+let array_remove_len values len index =
+  if len = 1 then [||]
   else
     let first = if index = 0 then values.(1) else values.(0) in
-    let result = Array.make (length - 1) first in
+    let result = Array.make (len - 1) first in
     Array.blit values 0 result 0 index;
-    Array.blit values (index + 1) result index (length - index - 1);
+    Array.blit values (index + 1) result index (len - index - 1);
     result
 
 let array_split values =
@@ -240,20 +273,25 @@ let array_chunks size values =
 let tree_leaf_refs_of_arrays arrays =
   arrays
   |> List.map (fun values ->
-      (values.(Array.length values - 1), Node.Leaf { values; address = None }))
+      ( values.(Array.length values - 1),
+        Node.Leaf
+          { values; len = Array.length values; owner = None; address = None } ))
 
 let tree_branch_refs_of_arrays settings keys children =
   let length = Array.length keys in
   if length = 0 then []
   else if length <= settings.branching_factor then
-    [ (keys.(length - 1), Node.Branch { keys; children; address = None }) ]
+    [
+      ( keys.(length - 1),
+        Node.Branch { keys; children; owner = None; address = None } );
+    ]
   else
     let key_chunks = array_split keys in
     let child_chunks = array_split children in
     List.map2
       (fun keys children ->
         ( keys.(Array.length keys - 1),
-          Node.Branch { keys; children; address = None } ))
+          Node.Branch { keys; children; owner = None; address = None } ))
       key_chunks child_chunks
 
 let stored_branch_refs_of_arrays settings keys children =
@@ -268,7 +306,13 @@ let stored_branch_refs_of_arrays settings keys children =
       let key_chunk = Array.sub keys offset chunk_length in
       let child_chunk = Array.sub children offset chunk_length in
       let branch =
-        Node.Branch { keys = key_chunk; children = child_chunk; address = None }
+        Node.Branch
+          {
+            keys = key_chunk;
+            children = child_chunk;
+            owner = None;
+            address = None;
+          }
       in
       loop
         ((key_chunk.(chunk_length - 1), branch) :: acc)
@@ -318,11 +362,49 @@ let branch_replace_one settings keys children index key child =
   children.(index) <- child;
   tree_branch_refs_of_arrays settings keys children
 
+let min_child_occupancy settings = max 1 ((settings.branching_factor + 1) / 2)
+
+let array_append left right =
+  let left_length = Array.length left in
+  let right_length = Array.length right in
+  if left_length = 0 then Array.copy right
+  else if right_length = 0 then Array.copy left
+  else
+    let result = Array.make (left_length + right_length) left.(0) in
+    Array.blit left 0 result 0 left_length;
+    Array.blit right 0 result left_length right_length;
+    result
+
+let leaf_ref values =
+  if Array.length values = 0 then invalid_arg "leaf ref requires values";
+  ( values.(Array.length values - 1),
+    Node.Leaf
+      { values; len = Array.length values; owner = None; address = None } )
+
+let branch_ref keys children =
+  let length = Array.length keys in
+  if length = 0 then invalid_arg "branch ref requires keys";
+  if length <> Array.length children then
+    invalid_arg "branch keys and children arity mismatch";
+  ( keys.(length - 1),
+    Node.Branch { keys; children; owner = None; address = None } )
+
+let ref_of_node = function
+  | Node.Ref { max_key; _ } as node -> (max_key, node)
+  | Node.Leaf { values; len; _ } as node ->
+      if len = 0 then invalid_arg "leaf ref requires values";
+      (values.(len - 1), node)
+  | Node.Branch { keys; children; _ } as node ->
+      let length = Array.length keys in
+      if length = 0 then invalid_arg "branch ref requires keys";
+      if length <> Array.length children then
+        invalid_arg "branch keys and children arity mismatch";
+      (keys.(length - 1), node)
+
 let total_cmp order_cmp equality_cmp left right =
   match order_cmp left right with 0 -> equality_cmp left right | n -> n
 
-let find_insert_index order_cmp equality_cmp value values =
-  let length = Array.length values in
+let find_insert_index_len order_cmp equality_cmp value values length =
   let low = ref 0 in
   let high = ref (length - 1) in
   while !low <= !high do
@@ -336,8 +418,7 @@ let find_insert_index order_cmp equality_cmp value values =
   then `Found index
   else `Insert index
 
-let find_remove_index order_cmp equality_cmp value values =
-  let length = Array.length values in
+let find_remove_index_len order_cmp equality_cmp value values length =
   let low = ref 0 in
   let high = ref (length - 1) in
   while !low <= !high do
@@ -351,8 +432,7 @@ let find_remove_index order_cmp equality_cmp value values =
   then Some index
   else None
 
-let find_index_by_cmp cmp value values =
-  let length = Array.length values in
+let find_index_by_cmp_len cmp value values length =
   let low = ref 0 in
   let high = ref (length - 1) in
   while !low <= !high do
@@ -363,8 +443,16 @@ let find_index_by_cmp cmp value values =
   let index = !low in
   if index < length && cmp values.(index) value = 0 then Some index else None
 
+let find_index_by_cmp cmp value values =
+  find_index_by_cmp_len cmp value values (Array.length values)
+
 let array_mem_by_cmp cmp value values =
   match find_index_by_cmp cmp value values with Some _ -> true | None -> false
+
+let array_mem_by_cmp_len cmp value values len =
+  match find_index_by_cmp_len cmp value values len with
+  | Some _ -> true
+  | None -> false
 
 let find_child_index key_cmp value keys =
   let length = Array.length keys in
@@ -391,16 +479,68 @@ let node_of_stored_branch keys child_addresses address =
     Array.mapi
       (fun index child_address ->
         let key = keys.(index) in
-        Node.Ref { max_key = key; address = child_address })
+        Node.Ref { max_key = key; address = child_address; cached = None })
       child_addresses
   in
-  Node.Branch { keys = Array.copy keys; children; address = Some address }
+  Node.Branch
+    { keys = Array.copy keys; children; owner = None; address = Some address }
+
+let node_of_stored_node storage address =
+  match restore_stored_node storage address with
+  | Leaf values ->
+      let values = Array.of_list values in
+      Node.Leaf
+        {
+          values;
+          len = Array.length values;
+          owner = None;
+          address = Some address;
+        }
+  | Branch (keys, child_addresses) ->
+      node_of_stored_branch keys child_addresses address
+
+let force_ref_node storage = function
+  | Node.Ref ref_ -> (
+      match ref_.cached with
+      | Some node -> node
+      | None ->
+          let node = node_of_stored_node storage ref_.address in
+          ref_.cached <- Some node;
+          node)
+  | node -> node
 
 type 'a node_edit_mode = Pure_tree | Stored_tree of 'a storage
 
 let storage_of_edit_mode = function
   | Stored_tree storage -> storage
   | Pure_tree -> invalid_arg "storage-backed node requires storage-aware edit"
+
+let node_leaf_values mode = function
+  | Node.Leaf { values; len; _ } ->
+      Some
+        (if len = Array.length values then values else Array.sub values 0 len)
+  | Node.Ref _ as node -> (
+      match mode with
+      | Pure_tree -> None
+      | Stored_tree storage -> (
+          match force_ref_node storage node with
+          | Node.Leaf { values; len; _ } ->
+              Some
+                (if len = Array.length values then values
+                 else Array.sub values 0 len)
+          | Node.Ref _ | Node.Branch _ -> None))
+  | Node.Branch _ -> None
+
+let node_branch_parts mode = function
+  | Node.Branch { keys; children; _ } -> Some (keys, children)
+  | Node.Ref _ as node -> (
+      match mode with
+      | Pure_tree -> None
+      | Stored_tree storage -> (
+          match force_ref_node storage node with
+          | Node.Branch { keys; children; _ } -> Some (keys, children)
+          | Node.Ref _ | Node.Leaf _ -> None))
+  | Node.Leaf _ -> None
 
 let add_leaf_refs settings mode inserted =
   match mode with
@@ -420,28 +560,207 @@ let branch_refs_of_arrays settings mode keys children =
   | Pure_tree -> tree_branch_refs_of_arrays settings keys children
   | Stored_tree _ -> stored_branch_refs_of_arrays settings keys children
 
+let branch_replace_range settings mode keys children start remove_count
+    replacements =
+  let refs = ref [] in
+  for index = Array.length children - 1 downto 0 do
+    if index = start then refs := replacements @ !refs;
+    if index < start || index >= start + remove_count then
+      refs := (keys.(index), children.(index)) :: !refs
+  done;
+  let keys, children = ref_arrays_of_list !refs in
+  branch_refs_of_arrays settings mode keys children
+
+let rebalance_leaf_child mode settings keys children index child =
+  match node_leaf_values mode child with
+  | None -> None
+  | Some values -> (
+      let minimum = min_child_occupancy settings in
+      if Array.length values >= minimum then None
+      else
+        let rebalance_with_right () =
+          if index + 1 >= Array.length children then None
+          else
+            match node_leaf_values mode children.(index + 1) with
+            | None -> None
+            | Some right ->
+                let combined_length =
+                  Array.length values + Array.length right
+                in
+                if combined_length <= settings.branching_factor then
+                  let merged = array_append values right in
+                  Some
+                    (branch_replace_range settings mode keys children index 2
+                       [ leaf_ref merged ])
+                else
+                  let needed = minimum - Array.length values in
+                  if needed <= 0 || Array.length right - needed < minimum then
+                    None
+                  else
+                    let borrowed = Array.sub right 0 needed in
+                    let left = array_append values borrowed in
+                    let right =
+                      Array.sub right needed (Array.length right - needed)
+                    in
+                    Some
+                      (branch_replace_range settings mode keys children index 2
+                         [ leaf_ref left; leaf_ref right ])
+        in
+        let rebalance_with_left () =
+          if index = 0 then None
+          else
+            match node_leaf_values mode children.(index - 1) with
+            | None -> None
+            | Some left ->
+                let combined_length = Array.length left + Array.length values in
+                if combined_length <= settings.branching_factor then
+                  let merged = array_append left values in
+                  Some
+                    (branch_replace_range settings mode keys children
+                       (index - 1) 2
+                       [ leaf_ref merged ])
+                else
+                  let needed = minimum - Array.length values in
+                  if needed <= 0 || Array.length left - needed < minimum then
+                    None
+                  else
+                    let left_keep = Array.length left - needed in
+                    let borrowed = Array.sub left left_keep needed in
+                    let left = Array.sub left 0 left_keep in
+                    let right = array_append borrowed values in
+                    Some
+                      (branch_replace_range settings mode keys children
+                         (index - 1) 2
+                         [ leaf_ref left; leaf_ref right ])
+        in
+        match rebalance_with_right () with
+        | Some changed -> Some changed
+        | None -> rebalance_with_left ())
+
+let rebalance_branch_child mode settings keys children index child =
+  match node_branch_parts mode child with
+  | None -> None
+  | Some (child_keys, child_children) -> (
+      let minimum = min_child_occupancy settings in
+      if Array.length child_keys >= minimum then None
+      else
+        let rebalance_with_right () =
+          if index + 1 >= Array.length children then None
+          else
+            match node_branch_parts mode children.(index + 1) with
+            | None -> None
+            | Some (right_keys, right_children) ->
+                let combined_length =
+                  Array.length child_keys + Array.length right_keys
+                in
+                if combined_length <= settings.branching_factor then
+                  let merged_keys = array_append child_keys right_keys in
+                  let merged_children =
+                    array_append child_children right_children
+                  in
+                  Some
+                    (branch_replace_range settings mode keys children index 2
+                       [ branch_ref merged_keys merged_children ])
+                else
+                  let needed = minimum - Array.length child_keys in
+                  if needed <= 0 || Array.length right_keys - needed < minimum
+                  then None
+                  else
+                    let borrowed_keys = Array.sub right_keys 0 needed in
+                    let borrowed_children = Array.sub right_children 0 needed in
+                    let left_keys = array_append child_keys borrowed_keys in
+                    let left_children =
+                      array_append child_children borrowed_children
+                    in
+                    let right_keys =
+                      Array.sub right_keys needed
+                        (Array.length right_keys - needed)
+                    in
+                    let right_children =
+                      Array.sub right_children needed
+                        (Array.length right_children - needed)
+                    in
+                    Some
+                      (branch_replace_range settings mode keys children index 2
+                         [
+                           branch_ref left_keys left_children;
+                           branch_ref right_keys right_children;
+                         ])
+        in
+        let rebalance_with_left () =
+          if index = 0 then None
+          else
+            match node_branch_parts mode children.(index - 1) with
+            | None -> None
+            | Some (left_keys, left_children) ->
+                let combined_length =
+                  Array.length left_keys + Array.length child_keys
+                in
+                if combined_length <= settings.branching_factor then
+                  let merged_keys = array_append left_keys child_keys in
+                  let merged_children =
+                    array_append left_children child_children
+                  in
+                  Some
+                    (branch_replace_range settings mode keys children
+                       (index - 1) 2
+                       [ branch_ref merged_keys merged_children ])
+                else
+                  let needed = minimum - Array.length child_keys in
+                  if needed <= 0 || Array.length left_keys - needed < minimum
+                  then None
+                  else
+                    let left_keep = Array.length left_keys - needed in
+                    let borrowed_keys = Array.sub left_keys left_keep needed in
+                    let borrowed_children =
+                      Array.sub left_children left_keep needed
+                    in
+                    let left_keys = Array.sub left_keys 0 left_keep in
+                    let left_children = Array.sub left_children 0 left_keep in
+                    let right_keys = array_append borrowed_keys child_keys in
+                    let right_children =
+                      array_append borrowed_children child_children
+                    in
+                    Some
+                      (branch_replace_range settings mode keys children
+                         (index - 1) 2
+                         [
+                           branch_ref left_keys left_children;
+                           branch_ref right_keys right_children;
+                         ])
+        in
+        match rebalance_with_right () with
+        | Some changed -> Some changed
+        | None -> rebalance_with_left ())
+
 let rec add_to_address storage settings order_cmp equality_cmp key_cmp value
     address =
   match restore_stored_node storage address with
   | Leaf values ->
       add_to_node (Stored_tree storage) settings order_cmp equality_cmp key_cmp
         value
-        (Node.Leaf { values = Array.of_list values; address = Some address })
+        (Node.Leaf
+           {
+             values = Array.of_list values;
+             len = List.length values;
+             owner = None;
+             address = Some address;
+           })
   | Branch (keys, child_addresses) ->
       add_to_node (Stored_tree storage) settings order_cmp equality_cmp key_cmp
         value
         (node_of_stored_branch keys child_addresses address)
 
 and add_to_node mode settings order_cmp equality_cmp key_cmp value = function
-  | Node.Ref { address; _ } ->
+  | Node.Ref _ as node ->
       let storage = storage_of_edit_mode mode in
-      add_to_address storage settings order_cmp equality_cmp key_cmp value
-        address
-  | Node.Leaf { values; _ } -> (
-      match find_insert_index order_cmp equality_cmp value values with
+      add_to_node mode settings order_cmp equality_cmp key_cmp value
+        (force_ref_node storage node)
+  | Node.Leaf { values; len; _ } -> (
+      match find_insert_index_len order_cmp equality_cmp value values len with
       | `Found _ -> Tree_edit_unchanged
       | `Insert index ->
-          let inserted = array_insert values index value in
+          let inserted = array_insert_len values len index value in
           Tree_edit_changed (add_leaf_refs settings mode inserted))
   | Node.Branch { keys; children; _ } -> (
       let index = find_child_index key_cmp value keys in
@@ -464,7 +783,13 @@ let rec remove_from_address storage settings order_cmp equality_cmp key_cmp
   | Leaf values ->
       remove_from_node (Stored_tree storage) settings order_cmp equality_cmp
         key_cmp value
-        (Node.Leaf { values = Array.of_list values; address = Some address })
+        (Node.Leaf
+           {
+             values = Array.of_list values;
+             len = List.length values;
+             owner = None;
+             address = Some address;
+           })
   | Branch (keys, child_addresses) ->
       remove_from_node (Stored_tree storage) settings order_cmp equality_cmp
         key_cmp value
@@ -472,21 +797,27 @@ let rec remove_from_address storage settings order_cmp equality_cmp key_cmp
 
 and remove_from_node mode settings order_cmp equality_cmp key_cmp value =
   function
-  | Node.Ref { address; _ } ->
+  | Node.Ref _ as node ->
       let storage = storage_of_edit_mode mode in
-      remove_from_address storage settings order_cmp equality_cmp key_cmp value
-        address
-  | Node.Leaf { values; _ } -> (
-      match find_remove_index order_cmp equality_cmp value values with
+      remove_from_node mode settings order_cmp equality_cmp key_cmp value
+        (force_ref_node storage node)
+  | Node.Leaf { values; len; _ } -> (
+      match find_remove_index_len order_cmp equality_cmp value values len with
       | None -> Tree_edit_unchanged
       | Some index -> (
-          array_remove values index |> function
+          array_remove_len values len index |> function
           | [||] -> Tree_edit_changed []
           | values ->
               Tree_edit_changed
                 [
                   ( values.(Array.length values - 1),
-                    Node.Leaf { values; address = None } );
+                    Node.Leaf
+                      {
+                        values;
+                        len = Array.length values;
+                        owner = None;
+                        address = None;
+                      } );
                 ]))
   | Node.Branch { keys; children; _ } -> (
       let index = find_child_index key_cmp value keys in
@@ -496,16 +827,331 @@ and remove_from_node mode settings order_cmp equality_cmp key_cmp value =
       with
       | Tree_edit_unchanged -> Tree_edit_unchanged
       | Tree_edit_changed [ (key, child) ] ->
-          branch_replace_one settings keys children index key child
-          |> fun changed -> Tree_edit_changed changed
+          let changed =
+            match
+              rebalance_leaf_child mode settings keys children index child
+            with
+            | Some changed -> changed
+            | None -> (
+                match
+                  rebalance_branch_child mode settings keys children index child
+                with
+                | Some changed -> changed
+                | None ->
+                    branch_replace_one settings keys children index key child)
+          in
+          Tree_edit_changed changed
       | Tree_edit_changed changed ->
           let keys, children = branch_splice_one keys children index changed in
           branch_refs_of_arrays settings mode keys children |> fun changed ->
           Tree_edit_changed changed)
 
+let transient_owner_counter = ref 0
+
+let next_transient_owner () =
+  incr transient_owner_counter;
+  !transient_owner_counter
+
+let owned_transient_node owner node =
+  match node with
+  | Node.Ref _ -> invalid_arg "transient tree should not contain stored refs"
+  | Node.Leaf leaf when leaf.owner = Some owner -> node
+  | Node.Leaf { values; len; _ } ->
+      let capacity = max (len + 1) (len * 2) in
+      let copied = Array.make capacity values.(0) in
+      Array.blit values 0 copied 0 len;
+      Node.Leaf { values = copied; len; owner = Some owner; address = None }
+  | Node.Branch branch when branch.owner = Some owner -> node
+  | Node.Branch { keys; children; _ } ->
+      Node.Branch
+        {
+          keys = Array.copy keys;
+          children = Array.copy children;
+          owner = Some owner;
+          address = None;
+        }
+
+let transient_leaf_refs_of_arrays owner node arrays =
+  match arrays with
+  | [] -> []
+  | first :: rest ->
+      (match node with
+      | Node.Leaf leaf ->
+          leaf.values <- first;
+          leaf.len <- Array.length first
+      | Node.Ref _ | Node.Branch _ -> invalid_arg "transient leaf expected");
+      ref_of_node node
+      :: List.map
+           (fun values ->
+             ( values.(Array.length values - 1),
+               Node.Leaf
+                 {
+                   values;
+                   len = Array.length values;
+                   owner = Some owner;
+                   address = None;
+                 } ))
+           rest
+
+let transient_branch_refs_of_arrays owner settings node keys children =
+  let length = Array.length keys in
+  if length = 0 then []
+  else if length <= settings.branching_factor then (
+    (match node with
+    | Node.Branch branch ->
+        branch.keys <- keys;
+        branch.children <- children
+    | Node.Ref _ | Node.Leaf _ -> invalid_arg "transient branch expected");
+    [ ref_of_node node ])
+  else
+    let key_chunks = array_split keys in
+    let child_chunks = array_split children in
+    match (key_chunks, child_chunks) with
+    | first_keys :: rest_keys, first_children :: rest_children ->
+        (match node with
+        | Node.Branch branch ->
+            branch.keys <- first_keys;
+            branch.children <- first_children
+        | Node.Ref _ | Node.Leaf _ -> invalid_arg "transient branch expected");
+        ref_of_node node
+        :: List.map2
+             (fun keys children ->
+               ( keys.(Array.length keys - 1),
+                 Node.Branch
+                   { keys; children; owner = Some owner; address = None } ))
+             rest_keys rest_children
+    | _ -> invalid_arg "transient branch split expected chunks"
+
+let transient_branch_of_refs owner refs =
+  let keys, children = List.split refs in
+  Node.Branch
+    {
+      keys = Array.of_list keys;
+      children = Array.of_list children;
+      owner = Some owner;
+      address = None;
+    }
+
+let rec add_to_transient_node owner settings order_cmp equality_cmp key_cmp
+    value node =
+  match node with
+  | Node.Ref _ -> invalid_arg "transient tree should not contain stored refs"
+  | Node.Leaf leaf -> (
+      match
+        find_insert_index_len order_cmp equality_cmp value leaf.values leaf.len
+      with
+      | `Found _ -> Tree_edit_unchanged
+      | `Insert index -> (
+          let node = owned_transient_node owner node in
+          match node with
+          | Node.Leaf leaf ->
+              let new_len = leaf.len + 1 in
+              let changed =
+                if new_len <= settings.branching_factor then (
+                  if new_len > Array.length leaf.values then (
+                    let capacity =
+                      max new_len
+                        (min settings.branching_factor
+                           (Array.length leaf.values * 2))
+                    in
+                    let values = Array.make capacity value in
+                    Array.blit leaf.values 0 values 0 index;
+                    values.(index) <- value;
+                    Array.blit leaf.values index values (index + 1)
+                      (leaf.len - index);
+                    leaf.values <- values)
+                  else (
+                    Array.blit leaf.values index leaf.values (index + 1)
+                      (leaf.len - index);
+                    leaf.values.(index) <- value);
+                  leaf.len <- new_len;
+                  [ ref_of_node node ])
+                else
+                  transient_leaf_refs_of_arrays owner node
+                    (array_split
+                       (array_insert_len leaf.values leaf.len index value))
+              in
+              Tree_edit_changed changed
+          | Node.Ref _ | Node.Branch _ -> invalid_arg "transient leaf expected")
+      )
+  | Node.Branch branch -> (
+      let index = find_child_index key_cmp value branch.keys in
+      match
+        add_to_transient_node owner settings order_cmp equality_cmp key_cmp
+          value branch.children.(index)
+      with
+      | Tree_edit_unchanged -> Tree_edit_unchanged
+      | Tree_edit_changed [ (key, child) ] -> (
+          let node = owned_transient_node owner node in
+          match node with
+          | Node.Branch branch ->
+              branch.keys.(index) <- key;
+              branch.children.(index) <- child;
+              Tree_edit_changed [ ref_of_node node ]
+          | Node.Ref _ | Node.Leaf _ -> invalid_arg "transient branch expected")
+      | Tree_edit_changed changed -> (
+          let node = owned_transient_node owner node in
+          match node with
+          | Node.Branch branch ->
+              let keys, children =
+                branch_splice_one branch.keys branch.children index changed
+              in
+              Tree_edit_changed
+                (transient_branch_refs_of_arrays owner settings node keys
+                   children)
+          | Node.Ref _ | Node.Leaf _ -> invalid_arg "transient branch expected")
+      )
+
+let rec remove_from_transient_node owner settings order_cmp equality_cmp key_cmp
+    value node =
+  match node with
+  | Node.Ref _ -> invalid_arg "transient tree should not contain stored refs"
+  | Node.Leaf leaf -> (
+      match
+        find_remove_index_len order_cmp equality_cmp value leaf.values leaf.len
+      with
+      | None -> Tree_edit_unchanged
+      | Some index -> (
+          let node = owned_transient_node owner node in
+          match node with
+          | Node.Leaf leaf ->
+              let new_len = leaf.len - 1 in
+              if new_len = 0 then Tree_edit_changed []
+              else (
+                Array.blit leaf.values (index + 1) leaf.values index
+                  (leaf.len - index - 1);
+                leaf.len <- new_len;
+                Tree_edit_changed [ ref_of_node node ])
+          | Node.Ref _ | Node.Branch _ -> invalid_arg "transient leaf expected")
+      )
+  | Node.Branch branch -> (
+      let index = find_child_index key_cmp value branch.keys in
+      match
+        remove_from_transient_node owner settings order_cmp equality_cmp key_cmp
+          value branch.children.(index)
+      with
+      | Tree_edit_unchanged -> Tree_edit_unchanged
+      | Tree_edit_changed [ (key, child) ] -> (
+          let node = owned_transient_node owner node in
+          match node with
+          | Node.Branch branch ->
+              let changed =
+                match
+                  rebalance_leaf_child Pure_tree settings branch.keys
+                    branch.children index child
+                with
+                | Some changed -> changed
+                | None -> (
+                    match
+                      rebalance_branch_child Pure_tree settings branch.keys
+                        branch.children index child
+                    with
+                    | Some changed -> changed
+                    | None ->
+                        branch.keys.(index) <- key;
+                        branch.children.(index) <- child;
+                        [ ref_of_node node ])
+              in
+              Tree_edit_changed changed
+          | Node.Ref _ | Node.Leaf _ -> invalid_arg "transient branch expected")
+      | Tree_edit_changed changed -> (
+          let node = owned_transient_node owner node in
+          match node with
+          | Node.Branch branch ->
+              let keys, children =
+                branch_splice_one branch.keys branch.children index changed
+              in
+              Tree_edit_changed
+                (transient_branch_refs_of_arrays owner settings node keys
+                   children)
+          | Node.Ref _ | Node.Leaf _ -> invalid_arg "transient branch expected")
+      )
+
+let rec transient_tree_result owner settings refs =
+  match refs with
+  | [] -> Empty
+  | [ (_, root) ] -> Tree { root; has_stored_address = false }
+  | refs -> (
+      match refs |> chunks settings.branching_factor with
+      | [] -> Empty
+      | [ refs ] ->
+          Tree
+            {
+              root = transient_branch_of_refs owner refs;
+              has_stored_address = false;
+            }
+      | ref_chunks ->
+          let refs =
+            List.map
+              (fun refs ->
+                let node = transient_branch_of_refs owner refs in
+                (node_ref_key refs, node))
+              ref_chunks
+          in
+          transient_tree_result owner settings refs)
+
+let add_to_transient_set owner value set =
+  match set.data with
+  | Tree { root; has_stored_address = false } -> (
+      match
+        add_to_transient_node owner set.set_settings set.cmp set.cmp set.cmp
+          value root
+      with
+      | Tree_edit_unchanged -> set
+      | Tree_edit_changed changed ->
+          {
+            set with
+            data = transient_tree_result owner set.set_settings changed;
+            count_cache = Option.map (fun count -> count + 1) set.count_cache;
+          })
+  | Empty ->
+      {
+        set with
+        data =
+          Tree
+            {
+              root =
+                Node.Leaf
+                  {
+                    values = [| value |];
+                    len = 1;
+                    owner = Some owner;
+                    address = None;
+                  };
+              has_stored_address = false;
+            };
+        count_cache = Some 1;
+      }
+  | Deferred _ | Tree { has_stored_address = true; _ } ->
+      invalid_arg "transient path edit requires an in-memory tree"
+
+let remove_from_transient_set owner value set =
+  match set.data with
+  | Tree { root; has_stored_address = false } -> (
+      match
+        remove_from_transient_node owner set.set_settings set.cmp set.cmp
+          set.cmp value root
+      with
+      | Tree_edit_unchanged -> set
+      | Tree_edit_changed changed ->
+          {
+            set with
+            data = transient_tree_result owner set.set_settings changed;
+            count_cache = Option.map (fun count -> count - 1) set.count_cache;
+          })
+  | Empty -> set
+  | Deferred _ | Tree { has_stored_address = true; _ } ->
+      invalid_arg "transient path edit requires an in-memory tree"
+
 let add value set =
   let equality_cmp = set.cmp in
   let key_cmp = set.cmp in
+  let increment_count_cache set =
+    {
+      set with
+      count_cache = Option.map (fun count -> count + 1) set.count_cache;
+    }
+  in
   match set.data with
   | Deferred { address } -> (
       let storage = storage_required set.set_storage in
@@ -515,10 +1161,11 @@ let add value set =
       with
       | Tree_edit_unchanged -> set
       | Tree_edit_changed changed ->
-          {
-            set with
-            data = data_of_changed_refs ~has_stored_address:true changed;
-          })
+          increment_count_cache
+            {
+              set with
+              data = data_of_changed_refs ~has_stored_address:true changed;
+            })
   | Tree { root; has_stored_address = true } -> (
       let storage = storage_required set.set_storage in
       match
@@ -527,10 +1174,11 @@ let add value set =
       with
       | Tree_edit_unchanged -> set
       | Tree_edit_changed changed ->
-          {
-            set with
-            data = data_of_changed_refs ~has_stored_address:true changed;
-          })
+          increment_count_cache
+            {
+              set with
+              data = data_of_changed_refs ~has_stored_address:true changed;
+            })
   | Tree { root; has_stored_address = false } -> (
       match
         add_to_node Pure_tree set.set_settings set.cmp equality_cmp key_cmp
@@ -538,15 +1186,20 @@ let add value set =
       with
       | Tree_edit_unchanged -> set
       | Tree_edit_changed changed ->
-          {
-            set with
-            data =
-              (match node_of_refs set.set_settings changed with
-              | None -> Empty
-              | Some root -> Tree { root; has_stored_address = false });
-          })
+          increment_count_cache
+            {
+              set with
+              data =
+                (match node_of_refs set.set_settings changed with
+                | None -> Empty
+                | Some root -> Tree { root; has_stored_address = false });
+            })
   | Empty ->
-      { set with data = data_of_sorted_values set.set_settings [ value ] }
+      {
+        set with
+        data = data_of_sorted_values set.set_settings [ value ];
+        count_cache = Some 1;
+      }
 
 let distinct_sorted_values cmp values =
   let rec loop acc = function
@@ -576,7 +1229,11 @@ let of_list_by ?settings ?storage ?cmp values =
   let values = Array.of_list values in
   Array.stable_sort set.cmp values;
   let values = distinct_sorted_array_values set.cmp values in
-  { set with data = data_of_sorted_values set.set_settings values }
+  {
+    set with
+    data = data_of_sorted_values set.set_settings values;
+    count_cache = Some (List.length values);
+  }
 
 let of_list values = of_list_by values
 
@@ -587,13 +1244,23 @@ let of_sorted_array_by ?settings ?storage ?cmp values =
     values_list := values.(i) :: !values_list
   done;
   let values = distinct_sorted_values set.cmp !values_list in
-  { set with data = data_of_sorted_values set.set_settings values }
+  {
+    set with
+    data = data_of_sorted_values set.set_settings values;
+    count_cache = Some (List.length values);
+  }
 
 let of_sorted_array values = of_sorted_array_by values
 
 let remove value set =
   let equality_cmp = set.cmp in
   let key_cmp = set.cmp in
+  let decrement_count_cache set =
+    {
+      set with
+      count_cache = Option.map (fun count -> count - 1) set.count_cache;
+    }
+  in
   match set.data with
   | Deferred { address } -> (
       let storage = storage_required set.set_storage in
@@ -603,10 +1270,11 @@ let remove value set =
       with
       | Tree_edit_unchanged -> set
       | Tree_edit_changed changed ->
-          {
-            set with
-            data = data_of_changed_refs ~has_stored_address:true changed;
-          })
+          decrement_count_cache
+            {
+              set with
+              data = data_of_changed_refs ~has_stored_address:true changed;
+            })
   | Tree { root; has_stored_address = true } -> (
       let storage = storage_required set.set_storage in
       match
@@ -615,10 +1283,11 @@ let remove value set =
       with
       | Tree_edit_unchanged -> set
       | Tree_edit_changed changed ->
-          {
-            set with
-            data = data_of_changed_refs ~has_stored_address:true changed;
-          })
+          decrement_count_cache
+            {
+              set with
+              data = data_of_changed_refs ~has_stored_address:true changed;
+            })
   | Tree { root; has_stored_address = false } -> (
       match
         remove_from_node Pure_tree set.set_settings set.cmp equality_cmp key_cmp
@@ -626,46 +1295,356 @@ let remove value set =
       with
       | Tree_edit_unchanged -> set
       | Tree_edit_changed changed ->
-          {
-            set with
-            data =
-              (match node_of_refs set.set_settings changed with
-              | None -> Empty
-              | Some root -> Tree { root; has_stored_address = false });
-          })
+          decrement_count_cache
+            {
+              set with
+              data =
+                (match node_of_refs set.set_settings changed with
+                | None -> Empty
+                | Some root -> Tree { root; has_stored_address = false });
+            })
   | Empty -> set
+
+type 'a invariant_info = {
+  min_key : 'a option;
+  max_key : 'a option;
+  count : int option;
+  height : int option;
+}
+
+let invariant_error message =
+  invalid_arg ("persistent sorted set invariant violation: " ^ message)
+
+let require_invariant condition message =
+  if not condition then invariant_error message
+
+let option_map2 f left right =
+  match (left, right) with
+  | Some left, Some right -> Some (f left right)
+  | _ -> None
+
+let validate_leaf_invariants cmp settings values len =
+  require_invariant (len > 0) "leaf must not be empty";
+  require_invariant
+    (len <= Array.length values)
+    "leaf len must not exceed array capacity";
+  require_invariant
+    (len <= settings.branching_factor)
+    "leaf len must not exceed branching_factor";
+  for index = 1 to len - 1 do
+    require_invariant
+      (cmp values.(index - 1) values.(index) < 0)
+      "leaf values must be strictly sorted and unique"
+  done;
+  {
+    min_key = Some values.(0);
+    max_key = Some values.(len - 1);
+    count = Some len;
+    height = Some 0;
+  }
+
+let rec validate_node_invariants storage cmp settings is_root = function
+  | Node.Ref { max_key; _ } ->
+      require_invariant (Option.is_some storage)
+        "stored ref requires storage on the set";
+      { min_key = None; max_key = Some max_key; count = None; height = None }
+  | Node.Leaf { values; len; _ } ->
+      validate_leaf_invariants cmp settings values len
+  | Node.Branch { keys; children; _ } ->
+      validate_branch_invariants storage cmp settings is_root keys children
+
+and validate_branch_invariants storage cmp settings is_root keys children =
+  let length = Array.length keys in
+  require_invariant (length > 0) "branch must not be empty";
+  require_invariant
+    (length = Array.length children)
+    "branch key count must equal child count";
+  require_invariant
+    (length <= settings.branching_factor)
+    "branch child count must not exceed branching_factor";
+  require_invariant
+    (is_root || length >= 1)
+    "non-root branch must have at least one child";
+  let total_count = ref (Some 0) in
+  let expected_height = ref None in
+  let first_min = ref None in
+  let previous_max = ref None in
+  for index = 0 to length - 1 do
+    if index > 0 then
+      require_invariant
+        (cmp keys.(index - 1) keys.(index) < 0)
+        "branch keys must be strictly sorted";
+    let child_info =
+      validate_node_invariants storage cmp settings false children.(index)
+    in
+    (match child_info.max_key with
+    | Some max_key ->
+        require_invariant
+          (cmp keys.(index) max_key = 0)
+          "branch key must equal child max key"
+    | None -> invariant_error "child max key must be known");
+    (match (!previous_max, child_info.min_key) with
+    | Some previous_max, Some child_min ->
+        require_invariant
+          (cmp previous_max child_min < 0)
+          "child ranges must be disjoint and ordered"
+    | _ -> ());
+    if index = 0 then first_min := child_info.min_key;
+    previous_max := child_info.max_key;
+    total_count := option_map2 ( + ) !total_count child_info.count;
+    match (!expected_height, child_info.height) with
+    | None, Some height -> expected_height := Some height
+    | Some expected, Some height ->
+        require_invariant (expected = height)
+          "all children under a branch must have the same height"
+    | _ -> ()
+  done;
+  {
+    min_key = !first_min;
+    max_key = Some keys.(length - 1);
+    count = !total_count;
+    height = Option.map (fun height -> height + 1) !expected_height;
+  }
+
+let validate_invariants set =
+  match set.data with
+  | Empty -> (
+      match set.count_cache with
+      | Some 0 | None -> ()
+      | Some _ -> invariant_error "empty set count cache must be zero")
+  | Deferred _ ->
+      require_invariant
+        (Option.is_some set.set_storage)
+        "deferred set requires storage"
+  | Tree { root; _ } -> (
+      let info =
+        validate_node_invariants set.set_storage set.cmp set.set_settings true
+          root
+      in
+      match set.count_cache with
+      | Some expected -> (
+          match info.count with
+          | Some actual ->
+              require_invariant (expected = actual)
+                "count cache must match actual tree cardinality"
+          | None -> ())
+      | None -> ())
+
+type 'a normalized_transient_op = {
+  op_value : 'a;
+  op_is_add : bool;
+  op_replaces_existing : bool;
+}
+
+type 'a transient_presence =
+  | Transient_absent
+  | Transient_existing
+  | Transient_new of 'a
+
+let transient_working_set set =
+  match set.data with
+  | Tree { has_stored_address = false; _ } -> Some set
+  | Empty | Deferred _ | Tree { has_stored_address = true; _ } -> None
+
+let transient set =
+  let owner = next_transient_owner () in
+  {
+    base = set;
+    operations = [];
+    working = transient_working_set set;
+    owner;
+    active = true;
+  }
+
+let ensure_transient_active builder =
+  if not builder.active then invalid_arg "transient builder is no longer active"
+
+let add_transient value builder =
+  ensure_transient_active builder;
+  match builder.working with
+  | Some working ->
+      builder.working <- Some (add_to_transient_set builder.owner value working)
+  | None -> builder.operations <- Add_transient value :: builder.operations
+
+let remove_transient value builder =
+  ensure_transient_active builder;
+  match builder.working with
+  | Some working ->
+      builder.working <-
+        Some (remove_from_transient_set builder.owner value working)
+  | None -> builder.operations <- Remove_transient value :: builder.operations
+
+let value_of_transient_op = function
+  | Add_transient value | Remove_transient value -> value
+
+let normalize_transient_operations cmp operations =
+  let operations = operations |> List.rev |> Array.of_list in
+  Array.stable_sort
+    (fun left right ->
+      cmp (value_of_transient_op left) (value_of_transient_op right))
+    operations;
+  let length = Array.length operations in
+  let apply_op presence op =
+    match op with
+    | Remove_transient _ -> Transient_absent
+    | Add_transient value -> (
+        match presence with
+        | Transient_absent -> Transient_new value
+        | Transient_existing | Transient_new _ -> presence)
+  in
+  let normalized_from_group fallback existing_state absent_state =
+    match (existing_state, absent_state) with
+    | Transient_absent, _ | _, Transient_absent ->
+        { op_value = fallback; op_is_add = false; op_replaces_existing = false }
+    | Transient_existing, Transient_new value ->
+        { op_value = value; op_is_add = true; op_replaces_existing = false }
+    | Transient_new value, Transient_new _ ->
+        { op_value = value; op_is_add = true; op_replaces_existing = true }
+    | Transient_existing, Transient_existing ->
+        { op_value = fallback; op_is_add = true; op_replaces_existing = false }
+    | Transient_new value, Transient_existing ->
+        { op_value = value; op_is_add = true; op_replaces_existing = true }
+  in
+  let rec collect acc index =
+    if index >= length then List.rev acc
+    else
+      let first_value = value_of_transient_op operations.(index) in
+      let rec group existing_state absent_state next =
+        if next >= length then (existing_state, absent_state, next)
+        else
+          let op = operations.(next) in
+          let value = value_of_transient_op op in
+          if cmp value first_value <> 0 then (existing_state, absent_state, next)
+          else
+            group
+              (apply_op existing_state op)
+              (apply_op absent_state op) (next + 1)
+      in
+      let existing_state, absent_state, next =
+        group
+          (apply_op Transient_existing operations.(index))
+          (apply_op Transient_absent operations.(index))
+          (index + 1)
+      in
+      collect
+        (normalized_from_group first_value existing_state absent_state :: acc)
+        next
+  in
+  collect [] 0
+
+let merge_transient_operations cmp base_values operations =
+  let rec loop acc base_values operations =
+    match (base_values, operations) with
+    | [], [] -> List.rev acc
+    | [], op :: operations ->
+        let acc = if op.op_is_add then op.op_value :: acc else acc in
+        loop acc [] operations
+    | value :: rest, [] -> loop (value :: acc) rest []
+    | value :: rest, op :: operations -> (
+        match cmp value op.op_value with
+        | n when n < 0 -> loop (value :: acc) rest (op :: operations)
+        | 0 ->
+            if op.op_is_add then
+              let kept =
+                if op.op_replaces_existing then op.op_value else value
+              in
+              loop (kept :: acc) rest operations
+            else loop acc rest operations
+        | _ ->
+            let acc = if op.op_is_add then op.op_value :: acc else acc in
+            loop acc base_values operations)
+  in
+  loop [] base_values operations
+
+let add_values_of_transient_operations operations =
+  let rec loop acc = function
+    | [] -> Some acc
+    | Add_transient value :: operations -> loop (value :: acc) operations
+    | Remove_transient _ :: _ -> None
+  in
+  loop [] operations
+
+let persistent_from_empty_adds builder values =
+  let values = Array.of_list values in
+  Array.stable_sort builder.base.cmp values;
+  let values = distinct_sorted_array_values builder.base.cmp values in
+  {
+    builder.base with
+    data = data_of_sorted_values builder.base.set_settings values;
+    count_cache = Some (List.length values);
+  }
+
+let transient_should_replay_path set =
+  match set.data with
+  | Deferred _ -> true
+  | Tree { has_stored_address; _ } -> has_stored_address
+  | Empty -> false
+
+let apply_transient_operation set = function
+  | Add_transient value -> add value set
+  | Remove_transient value -> remove value set
+
+let persistent_by_replay builder operations =
+  List.fold_left apply_transient_operation builder.base (List.rev operations)
+
+let persistent builder =
+  ensure_transient_active builder;
+  builder.active <- false;
+  match builder.working with
+  | Some working -> working
+  | None -> (
+      match builder.operations with
+      | [] -> builder.base
+      | operations -> (
+          let fast_empty_adds =
+            match builder.base.data with
+            | Empty -> add_values_of_transient_operations operations
+            | Tree _ | Deferred _ -> None
+          in
+          match fast_empty_adds with
+          | Some values -> persistent_from_empty_adds builder values
+          | None ->
+              if transient_should_replay_path builder.base then
+                persistent_by_replay builder operations
+              else
+                let operations =
+                  normalize_transient_operations builder.base.cmp operations
+                in
+                let values =
+                  merge_transient_operations builder.base.cmp
+                    (materialize builder.base) operations
+                in
+                {
+                  builder.base with
+                  data = data_of_sorted_values builder.base.set_settings values;
+                  count_cache = Some (List.length values);
+                }))
 
 type search_step = Found | Stop | Continue
 
 let rec search_deferred storage order_cmp equality_cmp value address =
   storage.accessed address;
   match storage.restore_node address with
-  | Some (Leaf values) -> (
-      let rec mem_by = function
-        | [] -> false
-        | current :: rest -> (
-            match order_cmp value current with
-            | n when n < 0 -> false
-            | 0 -> equality_cmp value current = 0 || mem_by rest
-            | _ -> mem_by rest)
-      in
-      if mem_by values then Found
+  | Some (Leaf values) ->
+      let values = Array.of_list values in
+      let cmp = total_cmp order_cmp equality_cmp in
+      if array_mem_by_cmp cmp value values then Found
       else
-        match last values with
-        | Some last_value when order_cmp value last_value <= 0 -> Stop
-        | _ -> Continue)
+        let length = Array.length values in
+        if length > 0 && order_cmp value values.(length - 1) <= 0 then Stop
+        else Continue
   | Some (Branch (keys, child_addresses)) -> (
-      let rec choose_child keys child_addresses =
-        match (keys, child_addresses) with
-        | [], [] -> None
-        | key :: _, child_address :: _
-          when route_cmp order_cmp equality_cmp value key <= 0 ->
-            Some child_address
-        | _ :: keys, _ :: child_addresses -> choose_child keys child_addresses
-        | [], _ :: _ | _ :: _, [] ->
-            invalid_arg "branch keys and addresses arity mismatch"
+      if List.length keys <> List.length child_addresses then
+        invalid_arg "branch keys and addresses arity mismatch";
+      let keys = Array.of_list keys in
+      let child_addresses = Array.of_list child_addresses in
+      let key_cmp = route_cmp order_cmp equality_cmp in
+      let child_address =
+        let length = Array.length keys in
+        if length = 0 || key_cmp value keys.(length - 1) > 0 then None
+        else Some child_addresses.(find_child_index key_cmp value keys)
       in
-      match choose_child keys child_addresses with
+      match child_address with
       | Some child_address ->
           search_deferred storage order_cmp equality_cmp value child_address
       | None -> Continue)
@@ -677,14 +1656,12 @@ let mem_in_deferred storage order_cmp equality_cmp value address =
   | Stop | Continue -> false
 
 let rec search_node_by_cmp storage cmp value = function
-  | Node.Ref { address; _ } ->
-      search_deferred (storage_required storage) cmp cmp value address
-  | Node.Leaf { values; _ } ->
-      if array_mem_by_cmp cmp value values then Found
-      else if
-        Array.length values > 0
-        && cmp value values.(Array.length values - 1) <= 0
-      then Stop
+  | Node.Ref _ as node ->
+      search_node_by_cmp storage cmp value
+        (force_ref_node (storage_required storage) node)
+  | Node.Leaf { values; len; _ } ->
+      if array_mem_by_cmp_len cmp value values len then Found
+      else if len > 0 && cmp value values.(len - 1) <= 0 then Stop
       else Continue
   | Node.Branch { keys; children; _ } ->
       let index = find_child_index cmp value keys in
@@ -715,24 +1692,27 @@ let rec fold_address storage f init address =
   | None -> invalid_arg ("stored node not found: " ^ address)
 
 let rec fold_node storage f init = function
-  | Node.Ref { address; _ } ->
-      fold_address (storage_required storage) f init address
-  | Node.Leaf { values; _ } -> Array.fold_left f init values
+  | Node.Ref _ as node ->
+      fold_node storage f init (force_ref_node (storage_required storage) node)
+  | Node.Leaf { values; len; _ } -> fold_array_prefix f init values len
   | Node.Branch { children; _ } ->
       Array.fold_left
         (fun acc child -> fold_node storage f acc child)
         init children
 
 let count (set : 'a t) =
-  match set.data with
-  | Tree { root; _ } ->
-      fold_node set.set_storage (fun count _ -> count + 1) 0 root
-  | Empty -> 0
-  | Deferred { address } ->
-      fold_address
-        (storage_required set.set_storage)
-        (fun count _ -> count + 1)
-        0 address
+  match set.count_cache with
+  | Some count -> count
+  | None -> (
+      match set.data with
+      | Tree { root; _ } ->
+          fold_node set.set_storage (fun count _ -> count + 1) 0 root
+      | Empty -> 0
+      | Deferred { address } ->
+          fold_address
+            (storage_required set.set_storage)
+            (fun count _ -> count + 1)
+            0 address)
 
 let to_list (set : 'a t) = materialize set
 
@@ -764,15 +1744,6 @@ let slice_values cmp from_ to_ values =
   |> List.filter (fun value ->
       lower_ok cmp from_ value && upper_ok cmp to_ value)
 
-let rec list_seq_slice cmp from_ to_ values () =
-  match values with
-  | [] -> Seq.Nil
-  | value :: rest ->
-      if not (lower_ok cmp from_ value) then
-        list_seq_slice cmp from_ to_ rest ()
-      else if not (upper_ok cmp to_ value) then Seq.Nil
-      else Seq.Cons (value, list_seq_slice cmp from_ to_ rest)
-
 let reverse_slice_values cmp from_ to_ values =
   values |> List.rev
   |> List.filter (fun value ->
@@ -782,28 +1753,9 @@ let reverse_slice_values cmp from_ to_ values =
       | None, Some to_ -> cmp value to_ >= 0
       | Some from_, Some to_ -> cmp value from_ <= 0 && cmp value to_ >= 0)
 
-let rec list_seq_reverse_slice cmp from_ to_ values () =
-  match values with
-  | [] -> Seq.Nil
-  | value :: rest -> (
-      let in_range =
-        match (from_, to_) with
-        | None, None -> true
-        | Some from_, None -> cmp value from_ <= 0
-        | None, Some to_ -> cmp value to_ >= 0
-        | Some from_, Some to_ -> cmp value from_ <= 0 && cmp value to_ >= 0
-      in
-      if in_range then
-        Seq.Cons (value, list_seq_reverse_slice cmp from_ to_ rest)
-      else
-        match from_ with
-        | Some lower when cmp value lower > 0 ->
-            list_seq_reverse_slice cmp from_ to_ rest ()
-        | _ -> Seq.Nil)
-
-let slice_array_into cmp from_ to_ values acc =
+let slice_array_into_len cmp from_ to_ values len acc =
   let rec loop acc index =
-    if index >= Array.length values then acc
+    if index >= len then acc
     else
       let value = values.(index) in
       if not (lower_ok cmp from_ value) then loop acc (index + 1)
@@ -812,7 +1764,7 @@ let slice_array_into cmp from_ to_ values acc =
   in
   loop acc 0
 
-let reverse_slice_array_into cmp from_ to_ values acc =
+let reverse_slice_array_into_len cmp from_ to_ values len acc =
   let rec loop acc index =
     if index < 0 then acc
     else
@@ -830,7 +1782,7 @@ let reverse_slice_array_into cmp from_ to_ values acc =
         | Some from_ when cmp value from_ > 0 -> loop acc (index - 1)
         | _ -> acc
   in
-  loop acc (Array.length values - 1)
+  loop acc (len - 1)
 
 let rec slice_deferred_into storage cmp from_ to_ address acc =
   storage.accessed address;
@@ -864,19 +1816,11 @@ let rec reverse_slice_deferred_into storage cmp from_ to_ address acc =
   | Some (Leaf values) ->
       List.rev_append (reverse_slice_values cmp from_ to_ values) acc
   | Some (Branch (keys, child_addresses)) ->
-      let rec annotate previous_key acc keys child_addresses =
+      let rec collect previous_key keys child_addresses acc =
         match (keys, child_addresses) with
         | [], [] -> acc
         | key :: keys, child_address :: child_addresses ->
-            annotate (Some key)
-              ((previous_key, key, child_address) :: acc)
-              keys child_addresses
-        | [], _ :: _ | _ :: _, [] ->
-            invalid_arg "branch keys and addresses arity mismatch"
-      in
-      let rec collect acc = function
-        | [] -> acc
-        | (previous_key, key, child_address) :: rest ->
+            let acc = collect (Some key) keys child_addresses acc in
             let child_above_range =
               match (from_, previous_key) with
               | Some from_, Some previous_key -> cmp previous_key from_ > 0
@@ -885,114 +1829,28 @@ let rec reverse_slice_deferred_into storage cmp from_ to_ address acc =
             let child_below_range =
               match to_ with Some to_ -> cmp key to_ < 0 | None -> false
             in
-            if child_above_range then collect acc rest
+            if child_above_range then acc
             else if child_below_range then acc
             else
-              collect
-                (reverse_slice_deferred_into storage cmp from_ to_ child_address
-                   acc)
-                rest
+              reverse_slice_deferred_into storage cmp from_ to_ child_address
+                acc
+        | [], _ :: _ | _ :: _, [] ->
+            invalid_arg "branch keys and addresses arity mismatch"
       in
-      collect acc (annotate None [] keys child_addresses)
+      collect None keys child_addresses acc
   | None -> invalid_arg ("stored node not found: " ^ address)
 
 let reverse_slice_deferred storage cmp from_ to_ address =
   List.rev (reverse_slice_deferred_into storage cmp from_ to_ address [])
 
-let rec slice_array_seq cmp from_ to_ values index () =
-  if index >= Array.length values then Seq.Nil
-  else
-    let value = values.(index) in
-    if not (lower_ok cmp from_ value) then
-      slice_array_seq cmp from_ to_ values (index + 1) ()
-    else if not (upper_ok cmp to_ value) then Seq.Nil
-    else Seq.Cons (value, slice_array_seq cmp from_ to_ values (index + 1))
-
-let rec reverse_slice_array_seq cmp from_ to_ values index () =
-  if index < 0 then Seq.Nil
-  else
-    let value = values.(index) in
-    let in_range =
-      match (from_, to_) with
-      | None, None -> true
-      | Some from_, None -> cmp value from_ <= 0
-      | None, Some to_ -> cmp value to_ >= 0
-      | Some from_, Some to_ -> cmp value from_ <= 0 && cmp value to_ >= 0
-    in
-    if in_range then
-      Seq.Cons (value, reverse_slice_array_seq cmp from_ to_ values (index - 1))
-    else
-      match from_ with
-      | Some lower when cmp value lower > 0 ->
-          reverse_slice_array_seq cmp from_ to_ values (index - 1) ()
-      | _ -> Seq.Nil
-
-let rec slice_deferred_seq storage cmp from_ to_ address () =
-  storage.accessed address;
-  match storage.restore_node address with
-  | Some (Leaf values) -> list_seq_slice cmp from_ to_ values ()
-  | Some (Branch (keys, child_addresses)) ->
-      let rec collect previous_key keys child_addresses () =
-        match (keys, child_addresses) with
-        | [], [] -> Seq.Nil
-        | key :: keys, child_address :: child_addresses ->
-            if child_after_range cmp to_ previous_key then Seq.Nil
-            else if child_before_range cmp from_ key then
-              collect (Some key) keys child_addresses ()
-            else
-              Seq.append
-                (slice_deferred_seq storage cmp from_ to_ child_address)
-                (collect (Some key) keys child_addresses)
-                ()
-        | [], _ :: _ | _ :: _, [] ->
-            invalid_arg "branch keys and addresses arity mismatch"
-      in
-      collect None keys child_addresses ()
-  | None -> invalid_arg ("stored node not found: " ^ address)
-
-let rec reverse_slice_deferred_seq storage cmp from_ to_ address () =
-  storage.accessed address;
-  match storage.restore_node address with
-  | Some (Leaf values) ->
-      list_seq_reverse_slice cmp from_ to_ (List.rev values) ()
-  | Some (Branch (keys, child_addresses)) ->
-      let rec annotate previous_key acc keys child_addresses =
-        match (keys, child_addresses) with
-        | [], [] -> acc
-        | key :: keys, child_address :: child_addresses ->
-            annotate (Some key)
-              ((previous_key, key, child_address) :: acc)
-              keys child_addresses
-        | [], _ :: _ | _ :: _, [] ->
-            invalid_arg "branch keys and addresses arity mismatch"
-      in
-      let rec collect refs () =
-        match refs with
-        | [] -> Seq.Nil
-        | (previous_key, key, child_address) :: rest ->
-            let child_above_range =
-              match (from_, previous_key) with
-              | Some from_, Some previous_key -> cmp previous_key from_ > 0
-              | _ -> false
-            in
-            let child_below_range =
-              match to_ with Some to_ -> cmp key to_ < 0 | None -> false
-            in
-            if child_above_range then collect rest ()
-            else if child_below_range then Seq.Nil
-            else
-              Seq.append
-                (reverse_slice_deferred_seq storage cmp from_ to_ child_address)
-                (collect rest) ()
-      in
-      collect (annotate None [] keys child_addresses) ()
-  | None -> invalid_arg ("stored node not found: " ^ address)
-
 let rec slice_tree_into storage cmp from_ to_ node acc =
   match node with
-  | Node.Ref { address; _ } ->
-      slice_deferred_into (storage_required storage) cmp from_ to_ address acc
-  | Node.Leaf { values; _ } -> slice_array_into cmp from_ to_ values acc
+  | Node.Ref _ ->
+      slice_tree_into storage cmp from_ to_
+        (force_ref_node (storage_required storage) node)
+        acc
+  | Node.Leaf { values; len; _ } ->
+      slice_array_into_len cmp from_ to_ values len acc
   | Node.Branch { keys; children; _ } ->
       let rec collect previous_key acc index =
         if index >= Array.length children then acc
@@ -1012,33 +1870,14 @@ let rec slice_tree_into storage cmp from_ to_ node acc =
 let slice_tree storage cmp from_ to_ root =
   List.rev (slice_tree_into storage cmp from_ to_ root [])
 
-let rec slice_tree_seq storage cmp from_ to_ node =
-  match node with
-  | Node.Ref { address; _ } ->
-      slice_deferred_seq (storage_required storage) cmp from_ to_ address
-  | Node.Leaf { values; _ } -> slice_array_seq cmp from_ to_ values 0
-  | Node.Branch { keys; children; _ } ->
-      let rec collect previous_key index () =
-        if index >= Array.length children then Seq.Nil
-        else
-          let key = keys.(index) in
-          if child_after_range cmp to_ previous_key then Seq.Nil
-          else if child_before_range cmp from_ key then
-            collect (Some key) (index + 1) ()
-          else
-            Seq.append
-              (slice_tree_seq storage cmp from_ to_ children.(index))
-              (collect (Some key) (index + 1))
-              ()
-      in
-      collect None 0
-
 let rec reverse_slice_tree_into storage cmp from_ to_ node acc =
   match node with
-  | Node.Ref { address; _ } ->
-      reverse_slice_deferred_into (storage_required storage) cmp from_ to_
-        address acc
-  | Node.Leaf { values; _ } -> reverse_slice_array_into cmp from_ to_ values acc
+  | Node.Ref _ ->
+      reverse_slice_tree_into storage cmp from_ to_
+        (force_ref_node (storage_required storage) node)
+        acc
+  | Node.Leaf { values; len; _ } ->
+      reverse_slice_array_into_len cmp from_ to_ values len acc
   | Node.Branch { keys; children; _ } ->
       let rec collect acc index =
         if index < 0 then acc
@@ -1068,38 +1907,253 @@ let rec reverse_slice_tree_into storage cmp from_ to_ node acc =
 let reverse_slice_tree storage cmp from_ to_ root =
   List.rev (reverse_slice_tree_into storage cmp from_ to_ root [])
 
-let rec reverse_slice_tree_seq storage cmp from_ to_ node =
-  match node with
-  | Node.Ref { address; _ } ->
-      reverse_slice_deferred_seq (storage_required storage) cmp from_ to_
-        address
-  | Node.Leaf { values; _ } ->
-      reverse_slice_array_seq cmp from_ to_ values (Array.length values - 1)
-  | Node.Branch { keys; children; _ } ->
-      let rec collect index () =
-        if index < 0 then Seq.Nil
-        else
-          let key = keys.(index) in
-          let previous_key =
-            if index = 0 then None else Some keys.(index - 1)
-          in
-          let child_above_range =
-            match (from_, previous_key) with
-            | Some from_, Some previous_key -> cmp previous_key from_ > 0
-            | _ -> false
-          in
-          let child_below_range =
-            match to_ with Some to_ -> cmp key to_ < 0 | None -> false
-          in
-          if child_above_range then collect (index - 1) ()
-          else if child_below_range then Seq.Nil
+type 'a cursor_child = Cursor_node of 'a node | Cursor_address of string
+
+type 'a cursor_frame = {
+  keys : 'a array;
+  children : 'a cursor_child array;
+  mutable index : int;
+}
+
+type 'a cursor = {
+  storage : 'a storage option;
+  cmp : 'a comparator;
+  direction : direction;
+  lower : 'a option;
+  upper : 'a option;
+  root : 'a cursor_child;
+  mutable initialized : bool;
+  mutable stack : 'a cursor_frame list;
+  mutable leaf : 'a array option;
+  mutable leaf_len : int;
+  mutable leaf_index : int;
+}
+
+let first_index_for_lower cmp lower keys =
+  match lower with
+  | None -> Some 0
+  | Some lower ->
+      let length = Array.length keys in
+      if length = 0 then None
+      else if cmp lower keys.(length - 1) > 0 then None
+      else Some (find_child_index cmp lower keys)
+
+let first_index_for_upper cmp upper keys =
+  match upper with
+  | None -> if Array.length keys = 0 then None else Some (Array.length keys - 1)
+  | Some upper ->
+      let length = Array.length keys in
+      if length = 0 then None else Some (find_child_index cmp upper keys)
+
+let lower_bound_index_len cmp lower values length =
+  match lower with
+  | None -> 0
+  | Some lower ->
+      let low = ref 0 in
+      let high = ref (length - 1) in
+      while !low <= !high do
+        let middle = (!low + !high) / 2 in
+        if cmp values.(middle) lower < 0 then low := middle + 1
+        else high := middle - 1
+      done;
+      !low
+
+let upper_bound_index_len cmp upper values length =
+  match upper with
+  | None -> length - 1
+  | Some upper ->
+      let low = ref 0 in
+      let high = ref (length - 1) in
+      while !low <= !high do
+        let middle = (!low + !high) / 2 in
+        if cmp values.(middle) upper <= 0 then low := middle + 1
+        else high := middle - 1
+      done;
+      !low - 1
+
+let cursor_children_of_addresses keys child_addresses =
+  if List.length keys <> List.length child_addresses then
+    invalid_arg "branch keys and addresses arity mismatch";
+  ( Array.of_list keys,
+    child_addresses
+    |> List.map (fun address -> Cursor_address address)
+    |> Array.of_list )
+
+let cursor_children_of_nodes children =
+  Array.map (fun child -> Cursor_node child) children
+
+let restore_cursor_child storage address =
+  storage.accessed address;
+  match storage.restore_node address with
+  | Some (Leaf values) ->
+      let values = Array.of_list values in
+      `Leaf (values, Array.length values)
+  | Some (Branch (keys, child_addresses)) ->
+      let keys, children = cursor_children_of_addresses keys child_addresses in
+      `Branch (keys, children)
+  | None -> invalid_arg ("stored node not found: " ^ address)
+
+let rec read_cursor_child storage = function
+  | Cursor_node (Node.Ref _ as node) ->
+      read_cursor_child storage
+        (Cursor_node (force_ref_node (storage_required storage) node))
+  | Cursor_node (Node.Leaf { values; len; _ }) -> `Leaf (values, len)
+  | Cursor_node (Node.Branch { keys; children; _ }) ->
+      `Branch (keys, cursor_children_of_nodes children)
+  | Cursor_address address ->
+      restore_cursor_child (storage_required storage) address
+
+let set_cursor_leaf cursor values len =
+  cursor.leaf <- Some values;
+  cursor.leaf_len <- len;
+  cursor.leaf_index <-
+    (match cursor.direction with
+    | Asc -> lower_bound_index_len cursor.cmp cursor.lower values len
+    | Desc -> upper_bound_index_len cursor.cmp cursor.upper values len)
+
+let push_cursor_branch cursor keys children =
+  if Array.length keys <> Array.length children then
+    invalid_arg "branch keys and children arity mismatch";
+  let index =
+    match cursor.direction with
+    | Asc -> first_index_for_lower cursor.cmp cursor.lower keys
+    | Desc -> first_index_for_upper cursor.cmp cursor.upper keys
+  in
+  match index with
+  | None -> ()
+  | Some index -> cursor.stack <- { keys; children; index } :: cursor.stack
+
+let rec load_cursor_child cursor child =
+  match read_cursor_child cursor.storage child with
+  | `Leaf (values, len) -> set_cursor_leaf cursor values len
+  | `Branch (keys, children) ->
+      push_cursor_branch cursor keys children;
+      load_next_cursor_leaf cursor
+
+and next_cursor_child cursor =
+  match cursor.stack with
+  | [] -> None
+  | frame :: rest -> (
+      match cursor.direction with
+      | Asc ->
+          if frame.index >= Array.length frame.children then (
+            cursor.stack <- rest;
+            next_cursor_child cursor)
           else
-            Seq.append
-              (reverse_slice_tree_seq storage cmp from_ to_ children.(index))
-              (collect (index - 1))
-              ()
-      in
-      collect (Array.length children - 1)
+            let previous_key =
+              if frame.index = 0 then None
+              else Some frame.keys.(frame.index - 1)
+            in
+            if child_after_range cursor.cmp cursor.upper previous_key then (
+              cursor.stack <- [];
+              None)
+            else
+              let child = frame.children.(frame.index) in
+              frame.index <- frame.index + 1;
+              Some child
+      | Desc ->
+          if frame.index < 0 then (
+            cursor.stack <- rest;
+            next_cursor_child cursor)
+          else
+            let key = frame.keys.(frame.index) in
+            let child_below_range =
+              match cursor.lower with
+              | Some lower -> cursor.cmp key lower < 0
+              | None -> false
+            in
+            if child_below_range then (
+              cursor.stack <- [];
+              None)
+            else
+              let child = frame.children.(frame.index) in
+              frame.index <- frame.index - 1;
+              Some child)
+
+and load_next_cursor_leaf cursor =
+  match next_cursor_child cursor with
+  | None -> cursor.leaf <- None
+  | Some child -> (
+      load_cursor_child cursor child;
+      match cursor.leaf with
+      | Some _ when cursor.leaf_len = 0 -> load_next_cursor_leaf cursor
+      | _ -> ())
+
+let init_cursor cursor =
+  if not cursor.initialized then (
+    cursor.initialized <- true;
+    load_cursor_child cursor cursor.root)
+
+let stop_cursor cursor =
+  cursor.stack <- [];
+  cursor.leaf <- None
+
+let rec next_cursor_value cursor () =
+  init_cursor cursor;
+  match cursor.leaf with
+  | None -> Seq.Nil
+  | Some values -> (
+      match cursor.direction with
+      | Asc ->
+          if cursor.leaf_index >= cursor.leaf_len then (
+            cursor.leaf <- None;
+            load_next_cursor_leaf cursor;
+            next_cursor_value cursor ())
+          else
+            let value = values.(cursor.leaf_index) in
+            if not (lower_ok cursor.cmp cursor.lower value) then (
+              cursor.leaf_index <- cursor.leaf_index + 1;
+              next_cursor_value cursor ())
+            else if not (upper_ok cursor.cmp cursor.upper value) then (
+              stop_cursor cursor;
+              Seq.Nil)
+            else (
+              cursor.leaf_index <- cursor.leaf_index + 1;
+              Seq.Cons (value, next_cursor_value cursor))
+      | Desc ->
+          if cursor.leaf_index < 0 then (
+            cursor.leaf <- None;
+            load_next_cursor_leaf cursor;
+            next_cursor_value cursor ())
+          else
+            let value = values.(cursor.leaf_index) in
+            let above_upper =
+              match cursor.upper with
+              | Some upper -> cursor.cmp value upper > 0
+              | None -> false
+            in
+            let below_lower =
+              match cursor.lower with
+              | Some lower -> cursor.cmp value lower < 0
+              | None -> false
+            in
+            if above_upper then (
+              cursor.leaf_index <- cursor.leaf_index - 1;
+              next_cursor_value cursor ())
+            else if below_lower then (
+              stop_cursor cursor;
+              Seq.Nil)
+            else (
+              cursor.leaf_index <- cursor.leaf_index - 1;
+              Seq.Cons (value, next_cursor_value cursor)))
+
+let cursor_seq storage cmp direction lower upper root =
+  let cursor =
+    {
+      storage;
+      cmp;
+      direction;
+      lower;
+      upper;
+      root;
+      initialized = false;
+      stack = [];
+      leaf = None;
+      leaf_len = 0;
+      leaf_index = 0;
+    }
+  in
+  next_cursor_value cursor
 
 let slice ?from_ ?to_ ?cmp (set : 'a t) =
   let cmp = Option.value ~default:set.cmp cmp in
@@ -1121,7 +2175,7 @@ let rslice ?from_ ?to_ ?cmp (set : 'a t) =
 
 let seq_source_of_set set =
   match set.data with
-  | Empty -> Seq_values []
+  | Empty -> Seq_empty
   | Tree { root; _ } -> Seq_tree { storage = set.set_storage; root }
   | Deferred { address } ->
       Seq_deferred { storage = storage_required set.set_storage; address }
@@ -1144,12 +2198,9 @@ let rseq (set : 'a t) =
     upper = None;
   }
 
-let seq_to_list seq =
+let seq_to_list (seq : 'a seq) =
   match (seq.source, seq.direction) with
-  | Seq_values values, Asc ->
-      slice_values seq.set_cmp seq.lower seq.upper values
-  | Seq_values values, Desc ->
-      reverse_slice_values seq.set_cmp seq.upper seq.lower values
+  | Seq_empty, (Asc | Desc) -> []
   | Seq_tree { storage; root }, Asc ->
       slice_tree storage seq.set_cmp seq.lower seq.upper root
   | Seq_tree { storage; root }, Desc ->
@@ -1159,28 +2210,27 @@ let seq_to_list seq =
   | Seq_deferred { storage; address }, Desc ->
       reverse_slice_deferred storage seq.set_cmp seq.upper seq.lower address
 
-let to_seq seq =
+let to_seq (seq : 'a seq) =
   match (seq.source, seq.direction) with
-  | Seq_values values, Asc ->
-      list_seq_slice seq.set_cmp seq.lower seq.upper values
-  | Seq_values values, Desc ->
-      list_seq_reverse_slice seq.set_cmp seq.upper seq.lower (List.rev values)
+  | Seq_empty, (Asc | Desc) -> Seq.empty
   | Seq_tree { storage; root }, Asc ->
-      slice_tree_seq storage seq.set_cmp seq.lower seq.upper root
+      cursor_seq storage seq.set_cmp Asc seq.lower seq.upper (Cursor_node root)
   | Seq_tree { storage; root }, Desc ->
-      reverse_slice_tree_seq storage seq.set_cmp seq.upper seq.lower root
+      cursor_seq storage seq.set_cmp Desc seq.lower seq.upper (Cursor_node root)
   | Seq_deferred { storage; address }, Asc ->
-      slice_deferred_seq storage seq.set_cmp seq.lower seq.upper address
+      cursor_seq (Some storage) seq.set_cmp Asc seq.lower seq.upper
+        (Cursor_address address)
   | Seq_deferred { storage; address }, Desc ->
-      reverse_slice_deferred_seq storage seq.set_cmp seq.upper seq.lower address
+      cursor_seq (Some storage) seq.set_cmp Desc seq.lower seq.upper
+        (Cursor_address address)
 
-let seq_reverse seq =
+let seq_reverse (seq : 'a seq) =
   let direction = match seq.direction with Asc -> Desc | Desc -> Asc in
   { seq with direction }
 
-let fold_seq f init seq = Seq.fold_left f init (to_seq seq)
+let fold_seq f init (seq : 'a seq) = Seq.fold_left f init (to_seq seq)
 
-let slice_seq ?from_ ?to_ ?cmp set =
+let slice_seq ?from_ ?to_ ?cmp (set : 'a t) =
   let set_cmp = Option.value ~default:set.cmp cmp |> normalize_cmp in
   {
     set_cmp;
@@ -1190,7 +2240,7 @@ let slice_seq ?from_ ?to_ ?cmp set =
     upper = to_;
   }
 
-let rslice_seq ?from_ ?to_ ?cmp set =
+let rslice_seq ?from_ ?to_ ?cmp (set : 'a t) =
   let set_cmp = Option.value ~default:set.cmp cmp |> normalize_cmp in
   {
     set_cmp;
@@ -1210,7 +2260,7 @@ let min_bound cmp left right =
   | None, bound | bound, None -> bound
   | Some left, Some right -> Some (if cmp left right <= 0 then left else right)
 
-let seek key seq =
+let seek key (seq : 'a seq) =
   let cmp = seq.set_cmp in
   let lower, upper =
     match seq.direction with
@@ -1250,11 +2300,13 @@ let rec store_branch_tree storage settings child_refs =
 let rec store_node_tree storage settings = function
   | Node.Ref { address; _ } -> (address, [ address ])
   | Node.Leaf { address = Some address; _ } -> (address, [ address ])
-  | Node.Leaf { values; address = None } ->
-      let address = storage.store_node (Leaf (Array.to_list values)) in
+  | Node.Leaf { values; len; address = None; _ } ->
+      let address =
+        storage.store_node (Leaf (array_prefix_to_list values len))
+      in
       (address, [ address ])
   | Node.Branch { address = Some address; _ } -> (address, [ address ])
-  | Node.Branch { keys; children; address = None } ->
+  | Node.Branch { keys; children; address = None; _ } ->
       let child_refs = ref [] in
       let child_address_lists = ref [] in
       for index = 0 to Array.length children - 1 do
@@ -1346,4 +2398,5 @@ let restore ?(cmp = default_cmp) ?(settings = default_settings) storage address
       set_settings = settings;
       set_storage = Some storage;
       data = Deferred { address };
+      count_cache = None;
     }
