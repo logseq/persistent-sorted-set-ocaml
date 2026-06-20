@@ -17,10 +17,14 @@ let default_names =
     "conj-10K";
     "transient-create-300K";
     "transient-add-10K";
+    "add-50K-plus-10K";
+    "transient-add-50K-plus-10K";
     "transient-single-add-50K";
     "transient-leaf-add-1K";
     "disj-10K";
     "transient-remove-10K";
+    "remove-50K-minus-10K";
+    "transient-remove-50K-minus-10K";
     "transient-single-remove-50K";
     "contains-10K";
     "count-300K";
@@ -51,7 +55,7 @@ let default_names =
   ]
 
 let default_config =
-  { warmup_ms = 2000.; sample_ms = 1000.; samples = 5; names = default_names }
+  { warmup_ms = 500.; sample_ms = 1000.; samples = 5; names = default_names }
 
 let parse_args () =
   let config = ref { default_config with names = [] } in
@@ -218,6 +222,20 @@ let bench_transient_add_10k () =
   done;
   builder |> persistent |> count |> consume_int
 
+let bench_add_50k_plus_10k () =
+  let set = ref (Lazy.force set_50k) in
+  for i = 0 to 9_999 do
+    set := add (50_000 + i) !set
+  done;
+  consume_int (count !set)
+
+let bench_transient_add_50k_plus_10k () =
+  let builder = transient (Lazy.force set_50k) in
+  for i = 0 to 9_999 do
+    add_transient (50_000 + i) builder
+  done;
+  builder |> persistent |> count |> consume_int
+
 let bench_transient_single_add_50k () =
   let builder = transient (Lazy.force set_50k) in
   add_transient 50_000 builder;
@@ -243,6 +261,20 @@ let bench_disj_10k () =
 
 let bench_transient_remove_10k () =
   let builder = transient (Lazy.force set_10k) in
+  for i = 0 to Array.length ints_10k - 1 do
+    remove_transient ints_10k.(i) builder
+  done;
+  builder |> persistent |> count |> consume_int
+
+let bench_remove_50k_minus_10k () =
+  let set = ref (Lazy.force set_50k) in
+  for i = 0 to Array.length ints_10k - 1 do
+    set := remove ints_10k.(i) !set
+  done;
+  consume_int (count !set)
+
+let bench_transient_remove_50k_minus_10k () =
+  let builder = transient (Lazy.force set_50k) in
   for i = 0 to Array.length ints_10k - 1 do
     remove_transient ints_10k.(i) builder
   done;
@@ -407,10 +439,14 @@ let benches =
     ("conj-10K", bench_conj_10k);
     ("transient-create-300K", bench_transient_create_300k);
     ("transient-add-10K", bench_transient_add_10k);
+    ("add-50K-plus-10K", bench_add_50k_plus_10k);
+    ("transient-add-50K-plus-10K", bench_transient_add_50k_plus_10k);
     ("transient-single-add-50K", bench_transient_single_add_50k);
     ("transient-leaf-add-1K", bench_transient_leaf_add_1k);
     ("disj-10K", bench_disj_10k);
     ("transient-remove-10K", bench_transient_remove_10k);
+    ("remove-50K-minus-10K", bench_remove_50k_minus_10k);
+    ("transient-remove-50K-minus-10K", bench_transient_remove_50k_minus_10k);
     ("transient-single-remove-50K", bench_transient_single_remove_50k);
     ("contains-10K", bench_contains_10k);
     ("count-300K", bench_count_300k);
