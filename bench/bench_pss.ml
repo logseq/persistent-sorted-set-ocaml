@@ -160,7 +160,7 @@ let restored_wide_4096 =
 let stored_underfull_4k =
   lazy
     (let storage = build_storage () in
-     let settings = { branching_factor = 64 } in
+     let settings = { default_settings with branching_factor = 64 } in
      let _, stored =
        store
          (of_sorted_array_by ~storage ~settings ~cmp:compare
@@ -171,7 +171,7 @@ let stored_underfull_4k =
 let stored_nested_underfull_4k =
   lazy
     (let storage = build_storage () in
-     let settings = { branching_factor = 8 } in
+     let settings = { default_settings with branching_factor = 8 } in
      let _, stored =
        store
          (of_sorted_array_by ~storage ~settings ~cmp:compare
