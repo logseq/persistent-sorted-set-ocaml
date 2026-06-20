@@ -37,8 +37,9 @@ let set_timeout f milliseconds =
   ignore
     (Js.Unsafe.fun_call
        (Js.Unsafe.js_expr "setTimeout")
-       [| Js.Unsafe.inject (Js.wrap_callback f)
-        ; Js.Unsafe.inject (Js.number_of_float (float_of_int milliseconds))
+       [|
+         Js.Unsafe.inject (Js.wrap_callback f);
+         Js.Unsafe.inject (Js.number_of_float (float_of_int milliseconds));
        |])
 
 let force_full_collection () =
@@ -72,7 +73,9 @@ let check ref_type label =
     }
   in
   let settings = { branching_factor = 4; ref_type } in
-  let root, _ = store (of_list_by ~storage ~settings ~cmp:compare (irange 0 15)) in
+  let root, _ =
+    store (of_list_by ~storage ~settings ~cmp:compare (irange 0 15))
+  in
   let restored =
     match restore ~cmp:compare ~settings storage root with
     | Some restored -> restored

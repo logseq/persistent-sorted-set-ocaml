@@ -204,15 +204,18 @@ let bucket_range divisor ~from_ ~to_ values =
 let test_show_node_tree_string () =
   let one_leaf =
     root_node_exn "one-leaf show_node"
-      (of_list_by ~settings:{ default_settings with branching_factor = 3 } ~cmp:compare [ 3; 1; 2 ])
+      (of_list_by
+         ~settings:{ default_settings with branching_factor = 3 }
+         ~cmp:compare [ 3; 1; 2 ])
   in
   assert_equal_string "show_node renders leaf values"
     "Leaf(address=none len=3 values=[1; 2; 3])"
     (show_node string_of_int one_leaf);
   let branch_root =
     root_node_exn "branch show_node"
-      (of_list_by ~settings:{ default_settings with branching_factor = 3 } ~cmp:compare
-         [ 7; 6; 5; 4; 3; 2; 1; 0 ])
+      (of_list_by
+         ~settings:{ default_settings with branching_factor = 3 }
+         ~cmp:compare [ 7; 6; 5; 4; 3; 2; 1; 0 ])
   in
   assert_equal_string "show_node renders branch children"
     "Branch(address=none keys=[2; 5; 7])\n\
@@ -239,8 +242,9 @@ let test_show_node_tree_string () =
   in
   let _, stored =
     store
-      (of_list_by ~storage ~settings:{ default_settings with branching_factor = 4 } ~cmp:compare
-         (irange 0 9))
+      (of_list_by ~storage
+         ~settings:{ default_settings with branching_factor = 4 }
+         ~cmp:compare (irange 0 9))
   in
   (match root_node stored with
   | None -> ()
@@ -253,6 +257,102 @@ let test_show_node_tree_string () =
     \  Ref(address=node-2 max_key=7 cached=none)\n\
     \  Leaf(address=none len=3 values=[8; 9; 10])"
     (show_node string_of_int edited_root)
+
+let test_store_preserves_memory_tree_shape () =
+  let memory = Hashtbl.create 8 in
+  let writes = ref 0 in
+  let storage =
+    {
+      store_node =
+        (fun node ->
+          incr writes;
+          let address = "node-" ^ string_of_int !writes in
+          Hashtbl.replace memory address node;
+          address);
+      restore_node = (fun address -> Hashtbl.find_opt memory address);
+      accessed = (fun _ -> ());
+    }
+  in
+  let settings = { default_settings with branching_factor = 4 } in
+  let set =
+    List.fold_left
+      (fun set value -> add value set)
+      (empty_by ~storage ~settings ~cmp:compare ())
+      (irange 0 8)
+  in
+  let root, stored = store set in
+  assert_equal_int "storing a memory tree writes its leaves and root" 5 !writes;
+  assert_equal_list "stored memory tree keeps sorted values" (irange 0 8)
+    (to_list stored);
+  match Hashtbl.find_opt memory root with
+  | Some (Branch (keys, child_addresses)) ->
+      assert_equal_list "store preserves memory tree branch keys" [ 1; 3; 5; 8 ]
+        keys;
+      assert_equal_string_list "store preserves memory tree child addresses"
+        [ "node-1"; "node-2"; "node-3"; "node-4" ]
+        child_addresses;
+      let child_values =
+        List.map
+          (fun address ->
+            match Hashtbl.find_opt memory address with
+            | Some (Leaf values) -> values
+            | Some (Branch _) ->
+                failwith "memory tree children should be leaves"
+            | None -> failwith "memory tree child address should exist")
+          child_addresses
+      in
+      assert_equal_list "store preserves memory tree leaf boundaries"
+        [ [ 0; 1 ]; [ 2; 3 ]; [ 4; 5 ]; [ 6; 7; 8 ] ]
+        child_values
+  | Some (Leaf _) -> failwith "stored memory tree should keep a branch root"
+  | None -> failwith "stored memory tree root should exist"
+
+let test_restored_add_uses_balanced_leaf_split () =
+  let memory = Hashtbl.create 8 in
+  let writes = ref 0 in
+  let storage =
+    {
+      store_node =
+        (fun node ->
+          incr writes;
+          let address = "node-" ^ string_of_int !writes in
+          Hashtbl.replace memory address node;
+          address);
+      restore_node = (fun address -> Hashtbl.find_opt memory address);
+      accessed = (fun _ -> ());
+    }
+  in
+  let settings = { default_settings with branching_factor = 4 } in
+  let root, _ =
+    store (of_list_by ~storage ~settings ~cmp:compare (irange 0 7))
+  in
+  let restored =
+    match restore ~cmp:compare ~settings storage root with
+    | Some restored -> restored
+    | None -> failwith "restore should find balanced split setup"
+  in
+  let added_root, _ = store (add 8 restored) in
+  assert_equal_int "balanced restored add writes two split leaves and root" 6
+    !writes;
+  match Hashtbl.find_opt memory added_root with
+  | Some (Branch (keys, child_addresses)) -> (
+      assert_equal_list "balanced restored add updates branch keys" [ 3; 5; 8 ]
+        keys;
+      assert_equal_string_list
+        "balanced restored add reuses unchanged left leaf"
+        [ "node-1"; "node-4"; "node-5" ]
+        child_addresses;
+      match
+        (Hashtbl.find_opt memory "node-4", Hashtbl.find_opt memory "node-5")
+      with
+      | Some (Leaf left), Some (Leaf right) ->
+          assert_equal_list "balanced restored add left split leaf" [ 4; 5 ]
+            left;
+          assert_equal_list "balanced restored add right split leaf" [ 6; 7; 8 ]
+            right
+      | _ -> failwith "balanced restored add should write split leaves")
+  | Some (Leaf _) -> failwith "balanced restored add root should be a branch"
+  | None -> failwith "balanced restored add root should exist"
 
 let test_storage_backed_pure_trees_do_not_rescan_before_edits () =
   let build_storage () =
@@ -326,8 +426,9 @@ let test_of_list_by_bulk_builds_without_chained_updates () =
 
 let test_to_list_materializes_tree_linearly () =
   let set =
-    of_sorted_array_by ~settings:{ default_settings with branching_factor = 2 } ~cmp:compare
-      (Array.init 50_000 Fun.id)
+    of_sorted_array_by
+      ~settings:{ default_settings with branching_factor = 2 }
+      ~cmp:compare (Array.init 50_000 Fun.id)
   in
   let fold_time =
     best_time 3 (fun () -> fold (fun acc value -> value :: acc) [] set)
@@ -438,22 +539,22 @@ let test_restore_preserves_settings_for_later_edits () =
     "custom restored add reuses unchanged leaves and stores split branch levels"
     [
       added_root;
-      "node-7";
+      "node-6";
       "node-1";
       "node-2";
-      "node-3";
-      "node-6";
       "node-9";
+      "node-3";
+      "node-7";
       "node-8";
     ]
     (stored_addresses memory added_root);
   match Hashtbl.find_opt memory added_root with
   | Some (Branch (keys, child_addresses)) ->
       assert_equal_list "custom restored add root keys follow branching factor"
-        [ 15; 16 ] keys;
+        [ 7; 16 ] keys;
       assert_equal_list
         "custom restored add root addresses point at split branch nodes"
-        [ "node-7"; "node-9" ] child_addresses
+        [ "node-6"; "node-9" ] child_addresses
   | Some _ -> failwith "custom restored add root should be a branch"
   | None -> failwith "custom restored add root should be stored"
 
@@ -481,7 +582,8 @@ let test_ref_type_controls_restored_node_cache () =
   let strong_settings = { branching_factor = 4; ref_type = Strong } in
   let weak_settings = { branching_factor = 4; ref_type = Weak } in
   let root, _ =
-    store (of_list_by ~storage ~settings:strong_settings ~cmp:compare (irange 0 15))
+    store
+      (of_list_by ~storage ~settings:strong_settings ~cmp:compare (irange 0 15))
   in
   reads := 0;
   let strong =
@@ -489,31 +591,34 @@ let test_ref_type_controls_restored_node_cache () =
     | Some restored -> restored
     | None -> failwith "strong restore should find the stored root"
   in
-  if not (mem 15 strong) then failwith "strong restored set should contain stored value";
+  if not (mem 15 strong) then
+    failwith "strong restored set should contain stored value";
   let strong_first_reads = !reads in
-  if not (mem 15 strong) then failwith "strong restored set should contain stored value again";
-  assert_equal_int
-    "strong ref-type should keep restored nodes cached"
-    strong_first_reads
-    !reads;
+  if not (mem 15 strong) then
+    failwith "strong restored set should contain stored value again";
+  assert_equal_int "strong ref-type should keep restored nodes cached"
+    strong_first_reads !reads;
   reads := 0;
   let weak =
     match restore ~cmp:compare ~settings:weak_settings storage root with
     | Some restored -> restored
     | None -> failwith "weak restore should find the stored root"
   in
-  if not (mem 15 weak) then failwith "weak restored set should contain stored value";
+  if not (mem 15 weak) then
+    failwith "weak restored set should contain stored value";
   let weak_first_reads = !reads in
-  if not (mem 15 weak) then failwith "weak restored set should contain stored value again";
-  assert_equal_int
-    "weak ref-type should reuse restored nodes before collection"
-    weak_first_reads
-    !reads;
+  if not (mem 15 weak) then
+    failwith "weak restored set should contain stored value again";
+  assert_equal_int "weak ref-type should reuse restored nodes before collection"
+    weak_first_reads !reads;
   Gc.full_major ();
   Gc.compact ();
-  if not (mem 15 weak) then failwith "weak restored set should contain stored value after collection";
+  if not (mem 15 weak) then
+    failwith "weak restored set should contain stored value after collection";
   if !reads <= weak_first_reads then
-    failwith "weak ref-type should allow restored nodes to be released and fetched again"
+    failwith
+      "weak ref-type should allow restored nodes to be released and fetched \
+       again"
 
 let test_reclaimable_ref_types_release_restored_nodes_after_gc () =
   let check ref_type label =
@@ -542,7 +647,9 @@ let test_reclaimable_ref_types_release_restored_nodes_after_gc () =
       }
     in
     let settings = { branching_factor = 4; ref_type } in
-    let root, _ = store (of_list_by ~storage ~settings ~cmp:compare (irange 0 15)) in
+    let root, _ =
+      store (of_list_by ~storage ~settings ~cmp:compare (irange 0 15))
+    in
     let restored =
       match restore ~cmp:compare ~settings storage root with
       | Some restored -> restored
@@ -562,11 +669,16 @@ let test_reclaimable_ref_types_release_restored_nodes_after_gc () =
 let test_settings_validate_branching_factor () =
   assert_raises_invalid_arg "empty_by rejects branching factors below two"
     (fun () ->
-      ignore (empty_by ~settings:{ default_settings with branching_factor = 1 } ~cmp:compare ()));
+      ignore
+        (empty_by
+           ~settings:{ default_settings with branching_factor = 1 }
+           ~cmp:compare ()));
   assert_raises_invalid_arg "of_list_by rejects non-positive branching factors"
     (fun () ->
       ignore
-        (of_list_by ~settings:{ default_settings with branching_factor = 0 } ~cmp:compare [ 1; 2; 3 ]));
+        (of_list_by
+           ~settings:{ default_settings with branching_factor = 0 }
+           ~cmp:compare [ 1; 2; 3 ]));
   let memory = Hashtbl.create 1 in
   let storage =
     {
@@ -581,7 +693,9 @@ let test_settings_validate_branching_factor () =
   assert_raises_invalid_arg "restore rejects invalid branching factors"
     (fun () ->
       ignore
-        (restore ~cmp:compare ~settings:{ default_settings with branching_factor = 1 } storage "root"))
+        (restore ~cmp:compare
+           ~settings:{ default_settings with branching_factor = 1 }
+           storage "root"))
 
 let test_of_sorted_array_uses_sorted_input_and_settings () =
   let memory = Hashtbl.create 16 in
@@ -1380,9 +1494,9 @@ let test_storage_add_preserves_unchanged_leaf_addresses () =
    with
   | Some (Leaf left), Some (Leaf right) ->
       assert_equal_list "split left leaf contains the lower local values"
-        (irange 32 63) left;
+        (irange 32 47) left;
       assert_equal_list "split right leaf contains the upper local values"
-        [ 64 ] right
+        (irange 48 64) right
   | _ -> failwith "changed leaf should split into two new leaves");
   assert_equal_list "added stored set keeps sorted values" (irange 0 100)
     (to_list added_stored)
@@ -1572,7 +1686,9 @@ let test_restored_mem_reads_only_needed_leaves () =
   if not (mem 40 restored) then
     failwith "mem should find values after skipping earlier leaves";
   assert_equal_int
-    "restored mem should reuse the cached root and read only the matching later leaf" 1 !reads;
+    "restored mem should reuse the cached root and read only the matching \
+     later leaf"
+    1 !reads;
   assert_equal_list
     "restored mem should access only root and matching later leaf"
     [ "node-2"; root ] !accessed;
@@ -1701,7 +1817,8 @@ let test_restored_slice_reads_only_overlapping_leaves () =
     (irange 62 65)
     (slice ~from_:62 ~to_:65 restored);
   assert_equal_int
-    "restored slice across boundary should reuse cached root and first leaf" 1 !reads;
+    "restored slice across boundary should reuse cached root and first leaf" 1
+    !reads;
   assert_equal_list
     "restored slice across boundary should access root and two leaves"
     [ "node-3"; "node-2"; root ]
@@ -1749,8 +1866,9 @@ let test_restored_reverse_slice_reads_only_overlapping_leaves () =
     (irange 65 62)
     (rslice ~from_:65 ~to_:62 restored);
   assert_equal_int
-    "restored reverse slice across boundary should reuse cached root and first leaf" 1
-    !reads;
+    "restored reverse slice across boundary should reuse cached root and first \
+     leaf"
+    1 !reads;
   assert_equal_list
     "restored reverse slice across boundary should access root and two leaves"
     [ "node-2"; "node-3"; root ]
@@ -1985,10 +2103,10 @@ let test_storage_uses_nested_branch_nodes_for_very_large_sets () =
       assert_equal_list "root branch stores intermediate max keys"
         [ 1023; 1055 ] keys;
       assert_equal_list "root branch points to intermediate branches"
-        [ "node-34"; "node-35" ] child_addresses
+        [ "node-33"; "node-35" ] child_addresses
   | Some _ -> failwith "very large root should be a branch node"
   | None -> failwith "very large root address should be stored");
-  (match Hashtbl.find_opt memory "node-34" with
+  (match Hashtbl.find_opt memory "node-33" with
   | Some (Branch (keys, child_addresses)) ->
       assert_equal_list "first intermediate branch stores leaf max keys"
         (List.init 32 (fun index -> ((index + 1) * 32) - 1))
@@ -2004,7 +2122,7 @@ let test_storage_uses_nested_branch_nodes_for_very_large_sets () =
       assert_equal_list
         "second intermediate branch stores remaining leaf max key" [ 1055 ] keys;
       assert_equal_list
-        "second intermediate branch points to the remaining leaf" [ "node-33" ]
+        "second intermediate branch points to the remaining leaf" [ "node-34" ]
         child_addresses
   | Some _ -> failwith "second intermediate node should be a branch"
   | None -> failwith "second intermediate branch should be stored");
@@ -2061,9 +2179,9 @@ let test_storage_addresses_visit_stored_descendants () =
   assert_equal_string_list
     "restored nested stored_addresses should include root, branch, and leaf \
      addresses"
-    ([ "node-36"; "node-34" ]
+    ([ "node-36"; "node-33" ]
     @ List.init 32 (fun index -> "node-" ^ string_of_int (index + 1))
-    @ [ "node-35"; "node-33" ])
+    @ [ "node-35"; "node-34" ])
     (stored_addresses memory nested_root)
 
 let test_nested_storage_remove_reuses_unchanged_branch_addresses () =
@@ -2147,7 +2265,7 @@ let test_restored_nested_remove_reuses_unchanged_branch_addresses_lazily () =
     "restored nested remove should read root, changed branch, and changed leaf"
     3 !reads;
   assert_equal_list "restored nested remove should access only the changed path"
-    [ "node-2"; "node-34"; root ]
+    [ "node-2"; "node-33"; root ]
     !accessed;
   let removed_root, removed_stored = store removed in
   if removed_root = root then
@@ -2205,7 +2323,7 @@ let test_restored_nested_add_reuses_unchanged_branch_addresses_lazily () =
     "restored nested add should read root, changed branch, and changed leaf" 3
     !reads;
   assert_equal_list "restored nested add should access only the changed path"
-    [ "node-2"; "node-34"; root ]
+    [ "node-2"; "node-33"; root ]
     !accessed;
   let added_root, added_stored = store added in
   if added_root = root then
@@ -2219,7 +2337,7 @@ let test_restored_nested_add_reuses_unchanged_branch_addresses_lazily () =
   | Some (Branch (keys, child_addresses)) ->
       assert_equal_list
         "restored nested add root updates split first branch max keys"
-        [ 992; 1024; 1055 ] keys;
+        [ 480; 1024; 1055 ] keys;
       assert_equal_list
         "restored nested add root reuses unchanged second branch"
         [ "node-39"; "node-40"; "node-35" ]
@@ -2250,6 +2368,8 @@ let test_tree_slice_to_seq_seeks_lazily () =
 
 let () =
   test_show_node_tree_string ();
+  test_store_preserves_memory_tree_shape ();
+  test_restored_add_uses_balanced_leaf_split ();
   test_storage_backed_pure_trees_do_not_rescan_before_edits ();
   test_of_list_by_bulk_builds_without_chained_updates ();
   test_to_list_materializes_tree_linearly ();

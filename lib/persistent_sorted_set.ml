@@ -21,11 +21,7 @@ module Node = struct
 end
 
 type 'a node = 'a Node.t
-
-type 'a data =
-  | Empty
-  | Tree of { root : 'a node; has_stored_address : bool }
-  | Deferred of { address : string }
+type 'a data = Empty | Tree of 'a node | Deferred of { address : string }
 
 type 'a t = {
   cmp : 'a comparator;
@@ -82,8 +78,8 @@ let cache_storage settings storage =
           (fun address ->
             match Hashtbl.find_opt cache address with
             | Some node -> Some node
-            | None ->
-                (match storage.restore_node address with
+            | None -> (
+                match storage.restore_node address with
                 | Some node ->
                     Hashtbl.replace cache address node;
                     Some node
@@ -210,14 +206,12 @@ let materialize_node storage node = materialize_node_into storage node []
 let materialize set =
   match set.data with
   | Empty -> []
-  | Tree { root; _ } -> materialize_node set.set_storage root
+  | Tree root -> materialize_node set.set_storage root
   | Deferred { address } ->
       materialize_address (storage_required set.set_storage) address
 
 let root_node set =
-  match set.data with
-  | Tree { root; _ } -> Some root
-  | Empty | Deferred _ -> None
+  match set.data with Tree root -> Some root | Empty | Deferred _ -> None
 
 let show_option_address = function None -> "none" | Some address -> address
 
@@ -305,12 +299,12 @@ let data_of_sorted_values settings values =
     |> node_leaf_refs_of_chunks |> node_of_refs settings
   with
   | None -> Empty
-  | Some root -> Tree { root; has_stored_address = false }
+  | Some root -> Tree root
 
-let data_of_changed_refs ~has_stored_address = function
+let data_of_changed_refs = function
   | [] -> Empty
-  | [ (_, root) ] -> Tree { root; has_stored_address }
-  | children -> Tree { root = node_branch_of_refs children; has_stored_address }
+  | [ (_, root) ] -> Tree root
+  | children -> Tree (node_branch_of_refs children)
 
 type 'a tree_edit_result =
   | Tree_edit_unchanged
@@ -340,16 +334,6 @@ let array_split values =
     Array.sub values left_length (length - left_length);
   ]
 
-let array_chunks size values =
-  let length = Array.length values in
-  let rec loop acc offset =
-    if offset >= length then List.rev acc
-    else
-      let chunk_length = min size (length - offset) in
-      loop (Array.sub values offset chunk_length :: acc) (offset + chunk_length)
-  in
-  loop [] 0
-
 let tree_leaf_refs_of_arrays arrays =
   arrays
   |> List.map (fun values ->
@@ -369,26 +353,6 @@ let tree_branch_refs_of_arrays settings keys children =
         ( keys.(Array.length keys - 1),
           Node.Branch { keys; children; address = None } ))
       key_chunks child_chunks
-
-let stored_branch_refs_of_arrays settings keys children =
-  if Array.length keys <> Array.length children then
-    invalid_arg "branch keys and children arity mismatch";
-  let rec loop acc offset =
-    if offset >= Array.length keys then List.rev acc
-    else
-      let chunk_length =
-        min settings.branching_factor (Array.length keys - offset)
-      in
-      let key_chunk = Array.sub keys offset chunk_length in
-      let child_chunk = Array.sub children offset chunk_length in
-      let branch =
-        Node.Branch { keys = key_chunk; children = child_chunk; address = None }
-      in
-      loop
-        ((key_chunk.(chunk_length - 1), branch) :: acc)
-        (offset + chunk_length)
-  in
-  loop [] 0
 
 let ref_arrays_of_list refs =
   let keys, children = List.split refs in
@@ -564,6 +528,10 @@ let storage_of_edit_mode = function
   | Stored_tree storage -> storage
   | Pure_tree -> invalid_arg "storage-backed node requires storage-aware edit"
 
+let edit_mode_of_storage = function
+  | Some storage -> Stored_tree storage
+  | None -> Pure_tree
+
 let node_leaf_values mode = function
   | Node.Leaf { values; len; _ } ->
       Some
@@ -591,26 +559,18 @@ let node_branch_parts mode = function
           | Node.Ref _ | Node.Leaf _ -> None))
   | Node.Leaf _ -> None
 
-let add_leaf_refs settings mode inserted =
-  match mode with
-  | Pure_tree ->
-      let changed =
-        if Array.length inserted <= settings.branching_factor then [ inserted ]
-        else array_split inserted
-      in
-      tree_leaf_refs_of_arrays changed
-  | Stored_tree _ ->
-      inserted
-      |> array_chunks settings.branching_factor
-      |> tree_leaf_refs_of_arrays
+let add_leaf_refs settings inserted =
+  let changed =
+    if Array.length inserted <= settings.branching_factor then [ inserted ]
+    else array_split inserted
+  in
+  tree_leaf_refs_of_arrays changed
 
-let branch_refs_of_arrays settings mode keys children =
-  match mode with
-  | Pure_tree -> tree_branch_refs_of_arrays settings keys children
-  | Stored_tree _ -> stored_branch_refs_of_arrays settings keys children
+let branch_refs_of_arrays settings keys children =
+  tree_branch_refs_of_arrays settings keys children
 
-let branch_replace_range settings mode keys children start remove_count
-    replacements =
+let branch_replace_range settings keys children start remove_count replacements
+    =
   let refs = ref [] in
   for index = Array.length children - 1 downto 0 do
     if index = start then refs := replacements @ !refs;
@@ -618,7 +578,7 @@ let branch_replace_range settings mode keys children start remove_count
       refs := (keys.(index), children.(index)) :: !refs
   done;
   let keys, children = ref_arrays_of_list !refs in
-  branch_refs_of_arrays settings mode keys children
+  branch_refs_of_arrays settings keys children
 
 let rebalance_leaf_child mode settings keys children index child =
   match node_leaf_values mode child with
@@ -639,7 +599,7 @@ let rebalance_leaf_child mode settings keys children index child =
                 if combined_length <= settings.branching_factor then
                   let merged = array_append values right in
                   Some
-                    (branch_replace_range settings mode keys children index 2
+                    (branch_replace_range settings keys children index 2
                        [ leaf_ref merged ])
                 else
                   let needed = minimum - Array.length values in
@@ -652,7 +612,7 @@ let rebalance_leaf_child mode settings keys children index child =
                       Array.sub right needed (Array.length right - needed)
                     in
                     Some
-                      (branch_replace_range settings mode keys children index 2
+                      (branch_replace_range settings keys children index 2
                          [ leaf_ref left; leaf_ref right ])
         in
         let rebalance_with_left () =
@@ -665,8 +625,7 @@ let rebalance_leaf_child mode settings keys children index child =
                 if combined_length <= settings.branching_factor then
                   let merged = array_append left values in
                   Some
-                    (branch_replace_range settings mode keys children
-                       (index - 1) 2
+                    (branch_replace_range settings keys children (index - 1) 2
                        [ leaf_ref merged ])
                 else
                   let needed = minimum - Array.length values in
@@ -678,8 +637,7 @@ let rebalance_leaf_child mode settings keys children index child =
                     let left = Array.sub left 0 left_keep in
                     let right = array_append borrowed values in
                     Some
-                      (branch_replace_range settings mode keys children
-                         (index - 1) 2
+                      (branch_replace_range settings keys children (index - 1) 2
                          [ leaf_ref left; leaf_ref right ])
         in
         match rebalance_with_right () with
@@ -708,7 +666,7 @@ let rebalance_branch_child mode settings keys children index child =
                     array_append child_children right_children
                   in
                   Some
-                    (branch_replace_range settings mode keys children index 2
+                    (branch_replace_range settings keys children index 2
                        [ branch_ref merged_keys merged_children ])
                 else
                   let needed = minimum - Array.length child_keys in
@@ -730,7 +688,7 @@ let rebalance_branch_child mode settings keys children index child =
                         (Array.length right_children - needed)
                     in
                     Some
-                      (branch_replace_range settings mode keys children index 2
+                      (branch_replace_range settings keys children index 2
                          [
                            branch_ref left_keys left_children;
                            branch_ref right_keys right_children;
@@ -751,8 +709,7 @@ let rebalance_branch_child mode settings keys children index child =
                     array_append left_children child_children
                   in
                   Some
-                    (branch_replace_range settings mode keys children
-                       (index - 1) 2
+                    (branch_replace_range settings keys children (index - 1) 2
                        [ branch_ref merged_keys merged_children ])
                 else
                   let needed = minimum - Array.length child_keys in
@@ -771,8 +728,7 @@ let rebalance_branch_child mode settings keys children index child =
                       array_append borrowed_children child_children
                     in
                     Some
-                      (branch_replace_range settings mode keys children
-                         (index - 1) 2
+                      (branch_replace_range settings keys children (index - 1) 2
                          [
                            branch_ref left_keys left_children;
                            branch_ref right_keys right_children;
@@ -809,7 +765,7 @@ and add_to_node mode settings order_cmp equality_cmp key_cmp value = function
       | `Found _ -> Tree_edit_unchanged
       | `Insert index ->
           let inserted = array_insert_len values len index value in
-          Tree_edit_changed (add_leaf_refs settings mode inserted))
+          Tree_edit_changed (add_leaf_refs settings inserted))
   | Node.Branch { keys; children; _ } -> (
       let index = find_child_index key_cmp value keys in
       match
@@ -822,7 +778,7 @@ and add_to_node mode settings order_cmp equality_cmp key_cmp value = function
           |> fun changed -> Tree_edit_changed changed
       | Tree_edit_changed changed ->
           let keys, children = branch_splice_one keys children index changed in
-          branch_refs_of_arrays settings mode keys children |> fun changed ->
+          branch_refs_of_arrays settings keys children |> fun changed ->
           Tree_edit_changed changed)
 
 let rec remove_from_address storage settings order_cmp equality_cmp key_cmp
@@ -885,7 +841,7 @@ and remove_from_node mode settings order_cmp equality_cmp key_cmp value =
           Tree_edit_changed changed
       | Tree_edit_changed changed ->
           let keys, children = branch_splice_one keys children index changed in
-          branch_refs_of_arrays settings mode keys children |> fun changed ->
+          branch_refs_of_arrays settings keys children |> fun changed ->
           Tree_edit_changed changed)
 
 let add value set =
@@ -906,28 +862,13 @@ let add value set =
       with
       | Tree_edit_unchanged -> set
       | Tree_edit_changed changed ->
-          increment_count_cache
-            {
-              set with
-              data = data_of_changed_refs ~has_stored_address:true changed;
-            })
-  | Tree { root; has_stored_address = true } -> (
-      let storage = storage_required set.set_storage in
+          increment_count_cache { set with data = data_of_changed_refs changed }
+      )
+  | Tree root -> (
       match
-        add_to_node (Stored_tree storage) set.set_settings set.cmp equality_cmp
-          key_cmp value root
-      with
-      | Tree_edit_unchanged -> set
-      | Tree_edit_changed changed ->
-          increment_count_cache
-            {
-              set with
-              data = data_of_changed_refs ~has_stored_address:true changed;
-            })
-  | Tree { root; has_stored_address = false } -> (
-      match
-        add_to_node Pure_tree set.set_settings set.cmp equality_cmp key_cmp
-          value root
+        add_to_node
+          (edit_mode_of_storage set.set_storage)
+          set.set_settings set.cmp equality_cmp key_cmp value root
       with
       | Tree_edit_unchanged -> set
       | Tree_edit_changed changed ->
@@ -937,7 +878,7 @@ let add value set =
               data =
                 (match node_of_refs set.set_settings changed with
                 | None -> Empty
-                | Some root -> Tree { root; has_stored_address = false });
+                | Some root -> Tree root);
             })
   | Empty ->
       {
@@ -1015,28 +956,13 @@ let remove value set =
       with
       | Tree_edit_unchanged -> set
       | Tree_edit_changed changed ->
-          decrement_count_cache
-            {
-              set with
-              data = data_of_changed_refs ~has_stored_address:true changed;
-            })
-  | Tree { root; has_stored_address = true } -> (
-      let storage = storage_required set.set_storage in
+          decrement_count_cache { set with data = data_of_changed_refs changed }
+      )
+  | Tree root -> (
       match
-        remove_from_node (Stored_tree storage) set.set_settings set.cmp
-          equality_cmp key_cmp value root
-      with
-      | Tree_edit_unchanged -> set
-      | Tree_edit_changed changed ->
-          decrement_count_cache
-            {
-              set with
-              data = data_of_changed_refs ~has_stored_address:true changed;
-            })
-  | Tree { root; has_stored_address = false } -> (
-      match
-        remove_from_node Pure_tree set.set_settings set.cmp equality_cmp key_cmp
-          value root
+        remove_from_node
+          (edit_mode_of_storage set.set_storage)
+          set.set_settings set.cmp equality_cmp key_cmp value root
       with
       | Tree_edit_unchanged -> set
       | Tree_edit_changed changed ->
@@ -1046,7 +972,7 @@ let remove value set =
               data =
                 (match node_of_refs set.set_settings changed with
                 | None -> Empty
-                | Some root -> Tree { root; has_stored_address = false });
+                | Some root -> Tree root);
             })
   | Empty -> set
 
@@ -1161,7 +1087,7 @@ let validate_invariants set =
       require_invariant
         (Option.is_some set.set_storage)
         "deferred set requires storage"
-  | Tree { root; _ } -> (
+  | Tree root -> (
       let info =
         validate_node_invariants set.set_storage set.cmp set.set_settings true
           root
@@ -1230,7 +1156,7 @@ let mem_in_node_by_cmp storage cmp value node =
 let mem value set =
   match set.data with
   | Empty -> false
-  | Tree { root; _ } -> mem_in_node_by_cmp set.set_storage set.cmp value root
+  | Tree root -> mem_in_node_by_cmp set.set_storage set.cmp value root
   | Deferred { address } ->
       mem_in_deferred
         (storage_required set.set_storage)
@@ -1260,8 +1186,7 @@ let count (set : 'a t) =
   | Some count -> count
   | None -> (
       match set.data with
-      | Tree { root; _ } ->
-          fold_node set.set_storage (fun count _ -> count + 1) 0 root
+      | Tree root -> fold_node set.set_storage (fun count _ -> count + 1) 0 root
       | Empty -> 0
       | Deferred { address } ->
           fold_address
@@ -1274,7 +1199,7 @@ let to_list (set : 'a t) = materialize set
 let fold f init set =
   match set.data with
   | Empty -> init
-  | Tree { root; _ } -> fold_node set.set_storage f init root
+  | Tree root -> fold_node set.set_storage f init root
   | Deferred { address } ->
       fold_address (storage_required set.set_storage) f init address
 
@@ -1714,7 +1639,7 @@ let slice ?from_ ?to_ ?cmp (set : 'a t) =
   let cmp = Option.value ~default:set.cmp cmp in
   match set.data with
   | Empty -> []
-  | Tree { root; _ } -> slice_tree set.set_storage cmp from_ to_ root
+  | Tree root -> slice_tree set.set_storage cmp from_ to_ root
   | Deferred { address } ->
       slice_deferred (storage_required set.set_storage) cmp from_ to_ address
 
@@ -1722,7 +1647,7 @@ let rslice ?from_ ?to_ ?cmp (set : 'a t) =
   let cmp = Option.value ~default:set.cmp cmp in
   match set.data with
   | Empty -> []
-  | Tree { root; _ } -> reverse_slice_tree set.set_storage cmp from_ to_ root
+  | Tree root -> reverse_slice_tree set.set_storage cmp from_ to_ root
   | Deferred { address } ->
       reverse_slice_deferred
         (storage_required set.set_storage)
@@ -1731,7 +1656,7 @@ let rslice ?from_ ?to_ ?cmp (set : 'a t) =
 let seq_source_of_set set =
   match set.data with
   | Empty -> Seq_empty
-  | Tree { root; _ } -> Seq_tree { storage = set.set_storage; root }
+  | Tree root -> Seq_tree { storage = set.set_storage; root }
   | Deferred { address } ->
       Seq_deferred { storage = storage_required set.set_storage; address }
 
@@ -1884,41 +1809,6 @@ let storage_of_set set =
   | None, Empty | None, Tree _ | None, Deferred _ ->
       invalid_arg "store requires a storage-backed set"
 
-let store_ordered_values storage settings iter =
-  let chunk_values = ref [] in
-  let chunk_length = ref 0 in
-  let child_refs = ref [] in
-  let flush_chunk () =
-    match !chunk_values with
-    | [] -> ()
-    | values ->
-        let values = List.rev values in
-        let address = storage.store_node (Leaf values) in
-        let key =
-          match last values with
-          | Some key -> key
-          | None -> invalid_arg "leaf chunk cannot be empty"
-        in
-        child_refs := (key, address) :: !child_refs;
-        chunk_values := [];
-        chunk_length := 0
-  in
-  let add_value value =
-    chunk_values := value :: !chunk_values;
-    incr chunk_length;
-    if !chunk_length = settings.branching_factor then flush_chunk ()
-  in
-  iter add_value;
-  flush_chunk ();
-  match List.rev !child_refs with
-  | [] -> storage.store_node (Leaf [])
-  | [ (_, address) ] -> address
-  | child_refs ->
-      let address, _branch_addresses =
-        store_branch_tree storage settings child_refs
-      in
-      address
-
 let store set =
   let storage = storage_of_set set in
   let stored_set address =
@@ -1926,22 +1816,11 @@ let store set =
   in
   match set.data with
   | Deferred { address } -> (address, set)
-  | Tree { root; has_stored_address = true } ->
+  | Tree root ->
       let address, _addresses = store_node_tree storage set.set_settings root in
       (address, stored_set address)
   | Empty ->
-      let address =
-        store_ordered_values storage set.set_settings (fun _add_value -> ())
-      in
-      (address, stored_set address)
-  | Tree { root; has_stored_address = false } ->
-      let address =
-        store_ordered_values storage set.set_settings (fun add_value ->
-            ignore
-              (fold_node set.set_storage
-                 (fun () value -> add_value value)
-                 () root))
-      in
+      let address = storage.store_node (Leaf []) in
       (address, stored_set address)
 
 let restore ?(cmp = default_cmp) ?(settings = default_settings) storage address
