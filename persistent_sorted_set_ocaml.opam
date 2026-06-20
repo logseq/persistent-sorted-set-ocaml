@@ -8,6 +8,7 @@ depends: [
   "ocaml" {>= "5.2.1"}
   "dune" {>= "3.17"}
   "js_of_ocaml-compiler" {with-test}
+  "js_of_ocaml" {with-test}
 ]
 build: [
   ["dune" "build" "-p" name "-j" jobs]
