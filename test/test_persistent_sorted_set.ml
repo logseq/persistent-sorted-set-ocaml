@@ -1028,6 +1028,22 @@ let test_fold_reduces_sets_and_sequences () =
   assert_equal_int "fold_seq sums reversed seek result" 12_471_375
     (fold_seq sum 0 (seq set |> seek 250 |> seq_reverse))
 
+let test_core__iter_over_transient () =
+  let original = of_list (irange 0 99) in
+  let sequence = seq original in
+  let ocaml_sequence = to_seq sequence in
+  let changed = add 100 original in
+  assert_equal_list "persistent sequence keeps the original values after add"
+    (irange 0 99) (seq_to_list sequence);
+  assert_equal_int "persistent sequence reduces original values" 4_950
+    (fold_seq ( + ) 0 sequence);
+  assert_equal_int "standard sequence reduces original values" 4_950
+    (Seq.fold_left ( + ) 0 ocaml_sequence);
+  assert_equal_list "original persistent set is unchanged after add"
+    (irange 0 99) (to_list original);
+  assert_equal_list "new persistent set contains the added value" (irange 0 100)
+    (to_list changed)
+
 let test_upstream_stresstest_btset_parity () =
   for iteration = 0 to 9 do
     let size = 1200 in
@@ -2390,6 +2406,7 @@ let () =
   test_seek ();
   test_slice_sequences_are_seekable_and_reversible ();
   test_fold_reduces_sets_and_sequences ();
+  test_core__iter_over_transient ();
   test_upstream_stresstest_btset_parity ();
   test_upstream_stresstest_slice_parity ();
   test_upstream_stresstest_rslice_parity ();
