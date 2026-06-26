@@ -1,4 +1,5 @@
 (library
  (name persistent_sorted_set)
  (public_name persistent_sorted_set_ocaml)
+ (modes native byte melange)
  (modules persistent_sorted_set))
