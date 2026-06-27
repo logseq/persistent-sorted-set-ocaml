@@ -2389,6 +2389,27 @@ let test_tree_slice_to_seq_seeks_lazily () =
        scanning the prefix: %d comparisons"
       !comparisons
 
+let test_tree_slice_to_seq_does_not_recheck_bounds_per_value () =
+  let comparisons = ref 0 in
+  let cmp left right =
+    incr comparisons;
+    compare left right
+  in
+  let set = of_list_by ~cmp (irange 0 10_000) in
+  comparisons := 0;
+  let count =
+    slice_seq ~from_:5_000 ~to_:9_000 set
+    |> to_seq
+    |> Seq.fold_left (fun count _ -> count + 1) 0
+  in
+  assert_equal_int "tree slice sequence returns the full requested range" 4_001
+    count;
+  if !comparisons > 1_000 then
+    failf
+      "tree slice sequence should not recheck slice bounds for every yielded \
+       value: %d comparisons"
+      !comparisons
+
 let () =
   test_show_node_tree_string ();
   test_store_preserves_memory_tree_shape ();
@@ -2444,4 +2465,5 @@ let () =
   test_nested_storage_remove_reuses_unchanged_branch_addresses ();
   test_restored_nested_remove_reuses_unchanged_branch_addresses_lazily ();
   test_restored_nested_add_reuses_unchanged_branch_addresses_lazily ();
-  test_tree_slice_to_seq_seeks_lazily ()
+  test_tree_slice_to_seq_seeks_lazily ();
+  test_tree_slice_to_seq_does_not_recheck_bounds_per_value ()

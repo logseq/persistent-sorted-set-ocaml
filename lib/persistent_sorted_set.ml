@@ -1368,7 +1368,7 @@ type 'a cursor = {
   storage : 'a storage option;
   cmp : 'a comparator;
   direction : direction;
-  lower : 'a option;
+  mutable lower : 'a option;
   upper : 'a option;
   root : 'a cursor_child;
   mutable initialized : bool;
@@ -1453,11 +1453,17 @@ let rec read_cursor_child storage = function
 
 let set_cursor_leaf cursor values len =
   cursor.leaf <- Some values;
-  cursor.leaf_len <- len;
   cursor.leaf_index <-
     (match cursor.direction with
-    | Asc -> lower_bound_index_len cursor.cmp cursor.lower values len
-    | Desc -> upper_bound_index_len cursor.cmp cursor.upper values len)
+    | Asc ->
+        cursor.leaf_len <-
+          upper_bound_index_len cursor.cmp cursor.upper values len + 1;
+        let index = lower_bound_index_len cursor.cmp cursor.lower values len in
+        cursor.lower <- None;
+        index
+    | Desc ->
+        cursor.leaf_len <- len;
+        upper_bound_index_len cursor.cmp cursor.upper values len)
 
 let push_cursor_branch cursor keys children =
   if Array.length keys <> Array.length children then
@@ -1549,15 +1555,8 @@ let rec next_cursor_value cursor () =
             next_cursor_value cursor ())
           else
             let value = values.(cursor.leaf_index) in
-            if not (lower_ok cursor.cmp cursor.lower value) then (
-              cursor.leaf_index <- cursor.leaf_index + 1;
-              next_cursor_value cursor ())
-            else if not (upper_ok cursor.cmp cursor.upper value) then (
-              stop_cursor cursor;
-              Seq.Nil)
-            else (
-              cursor.leaf_index <- cursor.leaf_index + 1;
-              Seq.Cons (value, next_cursor_value cursor))
+            cursor.leaf_index <- cursor.leaf_index + 1;
+            Seq.Cons (value, next_cursor_value cursor)
       | Desc ->
           if cursor.leaf_index < 0 then (
             cursor.leaf <- None;
