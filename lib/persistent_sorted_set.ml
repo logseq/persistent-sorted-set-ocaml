@@ -1542,47 +1542,48 @@ let stop_cursor cursor =
   cursor.stack <- [];
   cursor.leaf <- None
 
-let rec next_cursor_value cursor () =
-  init_cursor cursor;
+let rec next_cursor_value_asc cursor () =
   match cursor.leaf with
   | None -> Seq.Nil
-  | Some values -> (
-      match cursor.direction with
-      | Asc ->
-          if cursor.leaf_index >= cursor.leaf_len then (
-            cursor.leaf <- None;
-            load_next_cursor_leaf cursor;
-            next_cursor_value cursor ())
-          else
-            let value = values.(cursor.leaf_index) in
-            cursor.leaf_index <- cursor.leaf_index + 1;
-            Seq.Cons (value, next_cursor_value cursor)
-      | Desc ->
-          if cursor.leaf_index < 0 then (
-            cursor.leaf <- None;
-            load_next_cursor_leaf cursor;
-            next_cursor_value cursor ())
-          else
-            let value = values.(cursor.leaf_index) in
-            let above_upper =
-              match cursor.upper with
-              | Some upper -> cursor.cmp value upper > 0
-              | None -> false
-            in
-            let below_lower =
-              match cursor.lower with
-              | Some lower -> cursor.cmp value lower < 0
-              | None -> false
-            in
-            if above_upper then (
-              cursor.leaf_index <- cursor.leaf_index - 1;
-              next_cursor_value cursor ())
-            else if below_lower then (
-              stop_cursor cursor;
-              Seq.Nil)
-            else (
-              cursor.leaf_index <- cursor.leaf_index - 1;
-              Seq.Cons (value, next_cursor_value cursor)))
+  | Some values ->
+      if cursor.leaf_index >= cursor.leaf_len then (
+        cursor.leaf <- None;
+        load_next_cursor_leaf cursor;
+        next_cursor_value_asc cursor ())
+      else
+        let value = values.(cursor.leaf_index) in
+        cursor.leaf_index <- cursor.leaf_index + 1;
+        Seq.Cons (value, next_cursor_value_asc cursor)
+
+let rec next_cursor_value_desc cursor () =
+  match cursor.leaf with
+  | None -> Seq.Nil
+  | Some values ->
+      if cursor.leaf_index < 0 then (
+        cursor.leaf <- None;
+        load_next_cursor_leaf cursor;
+        next_cursor_value_desc cursor ())
+      else
+        let value = values.(cursor.leaf_index) in
+        let above_upper =
+          match cursor.upper with
+          | Some upper -> cursor.cmp value upper > 0
+          | None -> false
+        in
+        let below_lower =
+          match cursor.lower with
+          | Some lower -> cursor.cmp value lower < 0
+          | None -> false
+        in
+        if above_upper then (
+          cursor.leaf_index <- cursor.leaf_index - 1;
+          next_cursor_value_desc cursor ())
+        else if below_lower then (
+          stop_cursor cursor;
+          Seq.Nil)
+        else (
+          cursor.leaf_index <- cursor.leaf_index - 1;
+          Seq.Cons (value, next_cursor_value_desc cursor))
 
 let cursor_seq storage cmp direction lower upper root =
   let cursor =
@@ -1600,7 +1601,11 @@ let cursor_seq storage cmp direction lower upper root =
       leaf_index = 0;
     }
   in
-  next_cursor_value cursor
+  fun () ->
+    init_cursor cursor;
+    match direction with
+    | Asc -> next_cursor_value_asc cursor ()
+    | Desc -> next_cursor_value_desc cursor ()
 
 let slice ?from_ ?to_ ?cmp (set : 'a t) =
   let cmp = Option.value ~default:set.cmp cmp in
