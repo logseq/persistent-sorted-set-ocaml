@@ -59,38 +59,10 @@ let validate_settings settings =
 
 let settings set = set.set_settings
 
-module Weak_slot = struct
-  type 'a js_weak_ref
-
-  external make_js_weak_ref : 'a -> 'a js_weak_ref = "WeakRef" [@@mel.new]
-  external js_weak_ref_deref : 'a js_weak_ref -> 'a option = "deref" [@@mel.send]
-
-  type 'a t = Native of 'a Weak.t | Melange of 'a js_weak_ref option ref
-
-  let uses_melange_weak_ref () =
-    match Sys.backend_type with Other "Melange" -> true | _ -> false
-
-  let create () =
-    if uses_melange_weak_ref () then Melange (ref None)
-    else Native (Weak.create 1)
-
-  let set slot value =
-    match slot with
-    | Native slot -> Weak.set slot 0 (Some value)
-    | Melange slot ->
-        slot :=
-          (try Some (make_js_weak_ref value)
-           with _ -> None)
-
-  let get = function
-    | Native slot -> Weak.get slot 0
-    | Melange slot -> Option.bind !slot js_weak_ref_deref
-end
-
 let cache_storage settings storage =
   let remember cache address node =
-    let slot = Weak_slot.create () in
-    Weak_slot.set slot node;
+    let slot = Platform_weak_slot.create () in
+    Platform_weak_slot.set slot node;
     Hashtbl.replace cache address slot
   in
   let restore_uncached address =
@@ -130,7 +102,7 @@ let cache_storage settings storage =
           (fun address ->
             match Hashtbl.find_opt cache address with
             | Some slot -> (
-                match Weak_slot.get slot with
+                match Platform_weak_slot.get slot with
                 | Some node -> Some node
                 | None -> (
                     match restore_uncached address with

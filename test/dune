@@ -22,7 +22,7 @@
  (alias melange-storage-smoke)
  (module_systems es6)
  (modules melange_storage_smoke)
- (libraries persistent_sorted_set))
+ (libraries persistent_sorted_set_ocaml.melange))
 
 (rule
  (alias runtest)
