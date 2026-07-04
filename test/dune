@@ -1,6 +1,6 @@
 (executable
  (name test_persistent_sorted_set)
- (libraries persistent_sorted_set))
+ (libraries persistent_sorted_set_ocaml.native))
 
 (rule
  (alias runtest)
@@ -10,12 +10,12 @@
 (executable
  (name js_smoke)
  (modes js)
- (libraries persistent_sorted_set))
+ (libraries persistent_sorted_set_ocaml.native))
 
 (executable
  (name js_memory_test)
  (modes js)
- (libraries persistent_sorted_set js_of_ocaml))
+ (libraries persistent_sorted_set_ocaml.native js_of_ocaml))
 
 (melange.emit
  (target melange-storage-smoke)

@@ -2,6 +2,5 @@
  (name persistent_sorted_set)
  (public_name persistent_sorted_set_ocaml)
  (virtual_modules platform_weak_slot)
- (default_implementation persistent_sorted_set_ocaml.native)
  (modes native byte melange)
  (modules persistent_sorted_set platform_weak_slot))
