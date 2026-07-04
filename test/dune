@@ -46,11 +46,6 @@
  (alias runtest)
  (deps
   (alias melange-storage-smoke)
-  melange-storage-smoke/test/melange_storage_smoke.js
-  melange_weak_polyfill.mjs
-  run_melange_storage_smoke.mjs)
+  melange-storage-smoke/test/melange_storage_smoke.js)
  (action
-  (run
-   node
-   %{dep:run_melange_storage_smoke.mjs}
-   %{dep:melange-storage-smoke/test/melange_storage_smoke.js})))
+  (run node %{dep:melange-storage-smoke/test/melange_storage_smoke.js})))
