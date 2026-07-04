@@ -17,6 +17,13 @@
  (modes js)
  (libraries persistent_sorted_set js_of_ocaml))
 
+(melange.emit
+ (target melange-storage-smoke)
+ (alias melange-storage-smoke)
+ (module_systems es6)
+ (modules melange_storage_smoke)
+ (libraries persistent_sorted_set))
+
 (rule
  (alias runtest)
  (deps js_smoke.bc.js)
@@ -34,3 +41,16 @@
  (deps js_memory_test.bc.js run_browser_memory_test.js)
  (action
   (run node %{dep:run_browser_memory_test.js} %{dep:js_memory_test.bc.js})))
+
+(rule
+ (alias runtest)
+ (deps
+  (alias melange-storage-smoke)
+  melange-storage-smoke/test/melange_storage_smoke.js
+  melange_weak_polyfill.mjs
+  run_melange_storage_smoke.mjs)
+ (action
+  (run
+   node
+   %{dep:run_melange_storage_smoke.mjs}
+   %{dep:melange-storage-smoke/test/melange_storage_smoke.js})))
