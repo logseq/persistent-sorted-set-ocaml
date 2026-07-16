@@ -2,6 +2,12 @@
 
 An OCaml port of Logseq's persistent sorted set implementation.
 
+The virtual library and its platform implementations are published separately:
+
+- `persistent_sorted_set_ocaml` provides the shared API.
+- `persistent_sorted_set_ocaml-native` provides the native OCaml implementation.
+- `persistent_sorted_set_ocaml-melange` provides the Melange implementation.
+
 The library provides a persistent ordered set data structure intended for DataScript-style indexes, where ordered iteration, range access, and immutable updates are core operations.
 
 ## Goals

@@ -3,4 +3,13 @@
 
 (name persistent_sorted_set_ocaml)
 
+(package
+ (name persistent_sorted_set_ocaml))
+
+(package
+ (name persistent_sorted_set_ocaml-native))
+
+(package
+ (name persistent_sorted_set_ocaml-melange))
+
 (generate_opam_files false)

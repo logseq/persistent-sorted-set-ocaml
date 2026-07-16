@@ -1,6 +1,6 @@
 (library
  (name persistent_sorted_set_melange)
- (public_name persistent_sorted_set_ocaml.melange)
+ (public_name persistent_sorted_set_ocaml-melange)
  (implements persistent_sorted_set)
  (modes melange)
  (preprocess

@@ -1,7 +1,7 @@
 (executable
  (name bench_pss)
  (modes exe js)
- (libraries persistent_sorted_set_ocaml.native unix))
+ (libraries persistent_sorted_set_ocaml-native unix))
 
 (rule
  (alias bench)

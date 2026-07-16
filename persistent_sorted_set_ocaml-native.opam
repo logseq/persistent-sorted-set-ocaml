@@ -1,0 +1,14 @@
+opam-version: "2.0"
+synopsis: "Native implementation for persistent-sorted-set OCaml"
+description: "Native OCaml implementation of the persistent sorted set virtual library."
+maintainer: "tiensonqin"
+authors: ["tiensonqin"]
+license: "MIT"
+depends: [
+  "ocaml" {>= "5.2.1"}
+  "dune" {>= "3.17"}
+  "persistent_sorted_set_ocaml" {= version}
+]
+build: [
+  ["dune" "build" "-p" name "-j" jobs]
+]
