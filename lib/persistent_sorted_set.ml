@@ -1387,12 +1387,34 @@ let first_index_for_lower cmp lower keys =
       else if cmp lower keys.(length - 1) > 0 then None
       else Some (find_child_index cmp lower keys)
 
+let first_child_index_strict key_cmp value keys =
+  (* first index whose key is strictly greater than [value]; the last
+     child when no key exceeds it. Descending cursors need this instead
+     of [find_child_index]: with bound comparators that compare equal to
+     a whole region (e.g. prefix bounds), the non-strict variant lands on
+     the region's first subtree, while the correct descent starts at the
+     subtree holding the region's end. *)
+  let length = Array.length keys in
+  if length = 0 then invalid_arg "tree branch cannot be empty";
+  let low = ref 0 in
+  let high = ref (length - 1) in
+  let best = ref (-1) in
+  while !low <= !high do
+    let middle = (!low + !high) / 2 in
+    let key = keys.(middle) in
+    if key_cmp value key < 0 then (
+      best := middle;
+      high := middle - 1)
+    else low := middle + 1
+  done;
+  if !best < 0 then length - 1 else !best
+
 let first_index_for_upper cmp upper keys =
   match upper with
   | None -> if Array.length keys = 0 then None else Some (Array.length keys - 1)
   | Some upper ->
       let length = Array.length keys in
-      if length = 0 then None else Some (find_child_index cmp upper keys)
+      if length = 0 then None else Some (first_child_index_strict cmp upper keys)
 
 let lower_bound_index_len cmp lower values length =
   match lower with
