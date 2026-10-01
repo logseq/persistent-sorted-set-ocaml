@@ -1,7 +1,7 @@
 type 'a comparator = 'a -> 'a -> int
 type ref_type = Strong | Weak
 type settings = { branching_factor : int; ref_type : ref_type }
-type 'a stored_node = Leaf of 'a list | Branch of 'a list * string list
+type 'a stored_node = Leaf of 'a array | Branch of 'a array * string array
 
 type 'a storage = {
   store_node : 'a stored_node -> string;
@@ -167,26 +167,25 @@ let fold_array_prefix f init values len =
   done;
   !acc
 
-let prepend_list values init =
-  List.fold_right (fun value acc -> value :: acc) values init
-
 let storage_required = function
   | Some storage -> storage
   | None -> invalid_arg "storage-backed node requires storage"
 
 let rec materialize_address_with storage address tail =
   match storage.restore_node address with
-  | Some (Leaf values) -> prepend_list values (tail ())
+  | Some (Leaf values) -> prepend_array_prefix values (Array.length values) (tail ())
   | Some (Branch (_, child_addresses)) ->
       materialize_addresses_with storage child_addresses tail
   | None -> invalid_arg ("stored node not found: " ^ address)
 
 and materialize_addresses_with storage addresses tail =
-  match addresses with
-  | [] -> tail ()
-  | address :: rest ->
-      materialize_address_with storage address (fun () ->
-          materialize_addresses_with storage rest tail)
+  let rec loop index =
+    if index >= Array.length addresses then tail ()
+    else
+      materialize_address_with storage addresses.(index) (fun () ->
+          loop (index + 1))
+  in
+  loop 0
 
 let materialize_address storage address =
   materialize_address_with storage address (fun () -> [])
@@ -491,10 +490,8 @@ let find_child_index key_cmp value keys =
   if !best < 0 then length - 1 else !best
 
 let node_of_stored_branch keys child_addresses address =
-  if List.length keys <> List.length child_addresses then
+  if Array.length keys <> Array.length child_addresses then
     invalid_arg "branch keys and addresses arity mismatch";
-  let keys = Array.of_list keys in
-  let child_addresses = Array.of_list child_addresses in
   let children =
     Array.mapi
       (fun index child_address ->
@@ -507,7 +504,6 @@ let node_of_stored_branch keys child_addresses address =
 let node_of_stored_node storage address =
   match restore_stored_node storage address with
   | Leaf values ->
-      let values = Array.of_list values in
       Node.Leaf { values; len = Array.length values; address = Some address }
   | Branch (keys, child_addresses) ->
       node_of_stored_branch keys child_addresses address
@@ -723,8 +719,8 @@ let rec add_to_address storage settings order_cmp equality_cmp key_cmp value
       add_to_node (Some storage) settings order_cmp equality_cmp key_cmp value
         (Node.Leaf
            {
-             values = Array.of_list values;
-             len = List.length values;
+             values;
+             len = Array.length values;
              address = Some address;
            })
   | Branch (keys, child_addresses) ->
@@ -764,8 +760,8 @@ let rec remove_from_address storage settings order_cmp equality_cmp key_cmp
         value
         (Node.Leaf
            {
-             values = Array.of_list values;
-             len = List.length values;
+             values;
+             len = Array.length values;
              address = Some address;
            })
   | Branch (keys, child_addresses) ->
@@ -1079,7 +1075,6 @@ type search_step = Found | Stop | Continue
 let rec search_deferred storage order_cmp equality_cmp value address =
   match storage.restore_node address with
   | Some (Leaf values) ->
-      let values = Array.of_list values in
       let cmp = total_cmp order_cmp equality_cmp in
       if array_mem_by_cmp cmp value values then Found
       else
@@ -1087,10 +1082,8 @@ let rec search_deferred storage order_cmp equality_cmp value address =
         if length > 0 && order_cmp value values.(length - 1) <= 0 then Stop
         else Continue
   | Some (Branch (keys, child_addresses)) -> (
-      if List.length keys <> List.length child_addresses then
+      if Array.length keys <> Array.length child_addresses then
         invalid_arg "branch keys and addresses arity mismatch";
-      let keys = Array.of_list keys in
-      let child_addresses = Array.of_list child_addresses in
       let key_cmp = route_cmp order_cmp equality_cmp in
       let child_address =
         let length = Array.length keys in
@@ -1136,9 +1129,9 @@ let mem value set =
 
 let rec fold_address storage f init address =
   match storage.restore_node address with
-  | Some (Leaf values) -> List.fold_left f init values
+  | Some (Leaf values) -> Array.fold_left f init values
   | Some (Branch (_, child_addresses)) ->
-      List.fold_left
+      Array.fold_left
         (fun acc child_address -> fold_address storage f acc child_address)
         init child_addresses
   | None -> invalid_arg ("stored node not found: " ^ address)
@@ -1190,20 +1183,6 @@ let child_after_range cmp to_ previous_child_max =
   | Some to_, Some previous_child_max -> cmp previous_child_max to_ > 0
   | _ -> false
 
-let slice_values cmp from_ to_ values =
-  values
-  |> List.filter (fun value ->
-      lower_ok cmp from_ value && upper_ok cmp to_ value)
-
-let reverse_slice_values cmp from_ to_ values =
-  values |> List.rev
-  |> List.filter (fun value ->
-      match (from_, to_) with
-      | None, None -> true
-      | Some from_, None -> cmp value from_ <= 0
-      | None, Some to_ -> cmp value to_ >= 0
-      | Some from_, Some to_ -> cmp value from_ <= 0 && cmp value to_ >= 0)
-
 let slice_array_into_len cmp from_ to_ values len acc =
   let rec loop acc index =
     if index >= len then acc
@@ -1238,23 +1217,23 @@ let reverse_slice_array_into_len cmp from_ to_ values len acc =
 let rec slice_deferred_into storage cmp from_ to_ address acc =
   match storage.restore_node address with
   | Some (Leaf values) ->
-      List.rev_append (slice_values cmp from_ to_ values) acc
+      slice_array_into_len cmp from_ to_ values (Array.length values) acc
   | Some (Branch (keys, child_addresses)) ->
-      let rec collect previous_key acc keys child_addresses =
-        match (keys, child_addresses) with
-        | [], [] -> acc
-        | key :: keys, child_address :: child_addresses ->
-            if child_after_range cmp to_ previous_key then acc
-            else if child_before_range cmp from_ key then
-              collect (Some key) acc keys child_addresses
-            else
-              collect (Some key)
-                (slice_deferred_into storage cmp from_ to_ child_address acc)
-                keys child_addresses
-        | [], _ :: _ | _ :: _, [] ->
-            invalid_arg "branch keys and addresses arity mismatch"
+      if Array.length keys <> Array.length child_addresses then
+        invalid_arg "branch keys and addresses arity mismatch";
+      let rec collect index previous_key acc =
+        if index >= Array.length keys then acc
+        else
+          let key = keys.(index) in
+          let child_address = child_addresses.(index) in
+          if child_after_range cmp to_ previous_key then acc
+          else if child_before_range cmp from_ key then
+            collect (index + 1) (Some key) acc
+          else
+            collect (index + 1) (Some key)
+              (slice_deferred_into storage cmp from_ to_ child_address acc)
       in
-      collect None acc keys child_addresses
+      collect 0 None acc
   | None -> invalid_arg ("stored node not found: " ^ address)
 
 let slice_deferred storage cmp from_ to_ address =
@@ -1263,30 +1242,31 @@ let slice_deferred storage cmp from_ to_ address =
 let rec reverse_slice_deferred_into storage cmp from_ to_ address acc =
   match storage.restore_node address with
   | Some (Leaf values) ->
-      List.rev_append (reverse_slice_values cmp from_ to_ values) acc
+      reverse_slice_array_into_len cmp from_ to_ values (Array.length values)
+        acc
   | Some (Branch (keys, child_addresses)) ->
-      let rec collect previous_key keys child_addresses acc =
-        match (keys, child_addresses) with
-        | [], [] -> acc
-        | key :: keys, child_address :: child_addresses ->
-            let acc = collect (Some key) keys child_addresses acc in
-            let child_above_range =
-              match (from_, previous_key) with
-              | Some from_, Some previous_key -> cmp previous_key from_ > 0
-              | _ -> false
-            in
-            let child_below_range =
-              match to_ with Some to_ -> cmp key to_ < 0 | None -> false
-            in
-            if child_above_range then acc
-            else if child_below_range then acc
-            else
-              reverse_slice_deferred_into storage cmp from_ to_ child_address
-                acc
-        | [], _ :: _ | _ :: _, [] ->
-            invalid_arg "branch keys and addresses arity mismatch"
+      if Array.length keys <> Array.length child_addresses then
+        invalid_arg "branch keys and addresses arity mismatch";
+      let rec collect index previous_key acc =
+        if index >= Array.length keys then acc
+        else
+          let key = keys.(index) in
+          let child_address = child_addresses.(index) in
+          let acc = collect (index + 1) (Some key) acc in
+          let child_above_range =
+            match (from_, previous_key) with
+            | Some from_, Some previous_key -> cmp previous_key from_ > 0
+            | _ -> false
+          in
+          let child_below_range =
+            match to_ with Some to_ -> cmp key to_ < 0 | None -> false
+          in
+          if child_above_range then acc
+          else if child_below_range then acc
+          else
+            reverse_slice_deferred_into storage cmp from_ to_ child_address acc
       in
-      collect None keys child_addresses acc
+      collect 0 None acc
   | None -> invalid_arg ("stored node not found: " ^ address)
 
 let reverse_slice_deferred storage cmp from_ to_ address =
@@ -1443,21 +1423,17 @@ let upper_bound_index_len cmp upper values length =
       !low - 1
 
 let cursor_children_of_addresses keys child_addresses =
-  if List.length keys <> List.length child_addresses then
+  if Array.length keys <> Array.length child_addresses then
     invalid_arg "branch keys and addresses arity mismatch";
-  ( Array.of_list keys,
-    child_addresses
-    |> List.map (fun address -> Cursor_address address)
-    |> Array.of_list )
+  ( keys,
+    Array.map (fun address -> Cursor_address address) child_addresses )
 
 let cursor_children_of_nodes children =
   Array.map (fun child -> Cursor_node child) children
 
 let restore_cursor_child storage address =
   match storage.restore_node address with
-  | Some (Leaf values) ->
-      let values = Array.of_list values in
-      `Leaf (values, Array.length values)
+  | Some (Leaf values) -> `Leaf (values, Array.length values)
   | Some (Branch (keys, child_addresses)) ->
       let keys, children = cursor_children_of_addresses keys child_addresses in
       `Branch (keys, children)
@@ -1815,7 +1791,9 @@ let seek key (seq : 'a seq) =
   in
   { seq with lower; upper }
 
-let split_branch_refs refs = List.split refs
+let split_branch_refs refs =
+  let keys, child_addresses = List.split refs in
+  (Array.of_list keys, Array.of_list child_addresses)
 
 let branch_key refs =
   match last refs with
@@ -1847,9 +1825,7 @@ let rec store_node_tree storage settings = function
   | Node.Ref { address; _ } -> (address, [ address ])
   | Node.Leaf { address = Some address; _ } -> (address, [ address ])
   | Node.Leaf { values; len; address = None; _ } ->
-      let address =
-        storage.store_node (Leaf (array_prefix_to_list values len))
-      in
+      let address = storage.store_node (Leaf (Array.sub values 0 len)) in
       (address, [ address ])
   | Node.Branch { address = Some address; _ } -> (address, [ address ])
   | Node.Branch { keys; children; address = None; _ } ->
@@ -1886,7 +1862,7 @@ let store set =
       let address, _addresses = store_node_tree storage set.set_settings root in
       (address, stored_set address)
   | Empty ->
-      let address = storage.store_node (Leaf []) in
+      let address = storage.store_node (Leaf [||]) in
       (address, stored_set address)
 
 let restore ?count ?(cmp = default_cmp) ?(settings = default_settings) storage

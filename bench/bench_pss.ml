@@ -137,12 +137,12 @@ let restored_10k =
 let restored_wide_4096 =
   lazy
     (let memory = Hashtbl.create 4097 in
-     let keys = Array.to_list (Array.init 4_096 Fun.id) in
+     let keys = Array.init 4_096 Fun.id in
      let child_addresses =
-       List.map
+       Array.map
          (fun value ->
            let address = "leaf-" ^ string_of_int value in
-           Hashtbl.add memory address (Leaf [ value ]);
+           Hashtbl.add memory address (Leaf [| value |]);
            address)
          keys
      in

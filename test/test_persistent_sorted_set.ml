@@ -53,8 +53,9 @@ let assert_equal_int label expected actual =
     failf "%s: expected %d, got %d" label expected actual
 
 let copy_stored_node = function
-  | Leaf values -> Leaf values
-  | Branch (keys, child_addresses) -> Branch (keys, child_addresses)
+  | Leaf values -> Leaf (Array.copy values)
+  | Branch (keys, child_addresses) ->
+      Branch (Array.copy keys, Array.copy child_addresses)
 
 let force_full_collection () =
   for _ = 1 to 5 do
@@ -67,7 +68,7 @@ let stored_addresses memory root =
     match Hashtbl.find_opt memory address with
     | Some (Leaf _) -> [ address ]
     | Some (Branch (_, child_addresses)) ->
-        address :: List.concat_map loop child_addresses
+        address :: List.concat_map loop (Array.to_list child_addresses)
     | None -> failf "stored address not found: %s" address
   in
   loop root
@@ -287,19 +288,19 @@ let test_store_preserves_memory_tree_shape () =
   match Hashtbl.find_opt memory root with
   | Some (Branch (keys, child_addresses)) ->
       assert_equal_list "store preserves memory tree branch keys" [ 1; 3; 5; 8 ]
-        keys;
+        (Array.to_list keys);
       assert_equal_string_list "store preserves memory tree child addresses"
         [ "node-1"; "node-2"; "node-3"; "node-4" ]
-        child_addresses;
+        (Array.to_list child_addresses);
       let child_values =
         List.map
           (fun address ->
             match Hashtbl.find_opt memory address with
-            | Some (Leaf values) -> values
+            | Some (Leaf values) -> Array.to_list values
             | Some (Branch _) ->
                 failwith "memory tree children should be leaves"
             | None -> failwith "memory tree child address should exist")
-          child_addresses
+          (Array.to_list child_addresses)
       in
       assert_equal_list "store preserves memory tree leaf boundaries"
         [ [ 0; 1 ]; [ 2; 3 ]; [ 4; 5 ]; [ 6; 7; 8 ] ]
@@ -337,19 +338,19 @@ let test_restored_add_uses_balanced_leaf_split () =
   match Hashtbl.find_opt memory added_root with
   | Some (Branch (keys, child_addresses)) -> (
       assert_equal_list "balanced restored add updates branch keys" [ 3; 5; 8 ]
-        keys;
+        (Array.to_list keys);
       assert_equal_string_list
         "balanced restored add reuses unchanged left leaf"
         [ "node-1"; "node-4"; "node-5" ]
-        child_addresses;
+        (Array.to_list child_addresses);
       match
         (Hashtbl.find_opt memory "node-4", Hashtbl.find_opt memory "node-5")
       with
       | Some (Leaf left), Some (Leaf right) ->
           assert_equal_list "balanced restored add left split leaf" [ 4; 5 ]
-            left;
+            (Array.to_list left);
           assert_equal_list "balanced restored add right split leaf" [ 6; 7; 8 ]
-            right
+            (Array.to_list right)
       | _ -> failwith "balanced restored add should write split leaves")
   | Some (Leaf _) -> failwith "balanced restored add root should be a branch"
   | None -> failwith "balanced restored add root should exist"
@@ -470,10 +471,10 @@ let test_settings_control_storage_branching_factor () =
   (match Hashtbl.find_opt memory root with
   | Some (Branch (keys, child_addresses)) ->
       assert_equal_list "root branch keys use custom leaf boundaries"
-        [ 3; 7; 9 ] keys;
+        [ 3; 7; 9 ] (Array.to_list keys);
       assert_equal_list "root branch addresses use custom leaf boundaries"
         [ "node-1"; "node-2"; "node-3" ]
-        child_addresses
+        (Array.to_list child_addresses)
   | Some _ -> failwith "custom branching factor should create a branch root"
   | None -> failwith "custom root should be stored");
   if settings (empty ()) <> default_settings then
@@ -484,7 +485,7 @@ let test_settings_control_storage_branching_factor () =
   match Hashtbl.find_opt memory default_root with
   | Some (Leaf values) ->
       assert_equal_list "default branching factor keeps small sets in one leaf"
-        (irange 0 9) values
+        (irange 0 9) (Array.to_list values)
   | Some _ ->
       failwith "default branching factor should keep ten values in one leaf"
   | None -> failwith "default root should be stored"
@@ -553,10 +554,10 @@ let test_restore_preserves_settings_for_later_edits () =
   match Hashtbl.find_opt memory added_root with
   | Some (Branch (keys, child_addresses)) ->
       assert_equal_list "custom restored add root keys follow branching factor"
-        [ 7; 16 ] keys;
+        [ 7; 16 ] (Array.to_list keys);
       assert_equal_list
         "custom restored add root addresses point at split branch nodes"
-        [ "node-6"; "node-9" ] child_addresses
+        [ "node-6"; "node-9" ] (Array.to_list child_addresses)
   | Some _ -> failwith "custom restored add root should be a branch"
   | None -> failwith "custom restored add root should be stored"
 
@@ -731,11 +732,11 @@ let test_of_sorted_array_uses_sorted_input_and_settings () =
   (match Hashtbl.find_opt memory root with
   | Some (Branch (keys, child_addresses)) ->
       assert_equal_list "of_sorted_array_by branch keys follow custom chunks"
-        [ 2; 5; 6 ] keys;
+        [ 2; 5; 6 ] (Array.to_list keys);
       assert_equal_list
         "of_sorted_array_by branch addresses follow custom chunks"
         [ "node-1"; "node-2"; "node-3" ]
-        child_addresses
+        (Array.to_list child_addresses)
   | Some _ ->
       failwith "of_sorted_array_by custom settings should create a branch root"
   | None -> failwith "of_sorted_array_by root should be stored");
@@ -1387,10 +1388,10 @@ let test_storage_uses_leaf_and_branch_nodes_for_large_sets () =
   (match Hashtbl.find_opt memory root with
   | Some (Branch (keys, child_addresses)) ->
       assert_equal_list "root branch stores child max keys" [ 31; 63; 95; 100 ]
-        keys;
+        (Array.to_list keys);
       assert_equal_list "root branch stores child addresses"
         [ "node-1"; "node-2"; "node-3"; "node-4" ]
-        child_addresses
+        (Array.to_list child_addresses)
   | Some _ -> failwith "large root should be a branch node"
   | None -> failwith "large root address should be stored");
   assert_equal_int "large restore construction stays lazy" 0 !reads;
@@ -1416,7 +1417,7 @@ let test_storage_uses_leaf_and_branch_nodes_for_large_sets () =
   | Some (Branch (_, child_addresses)) ->
       assert_equal_list "appended root reuses unchanged leaves"
         [ "node-1"; "node-2"; "node-3"; "node-6" ]
-        child_addresses
+        (Array.to_list child_addresses)
   | Some _ -> failwith "appended root should be a branch node"
   | None -> failwith "appended root address should be stored"
 
@@ -1451,14 +1452,14 @@ let test_storage_remove_preserves_unchanged_leaf_addresses () =
   | Some (Branch (_, child_addresses)) ->
       assert_equal_list "removed root points at reused sibling leaves"
         [ "node-1"; "node-6"; "node-3"; "node-4" ]
-        child_addresses
+        (Array.to_list child_addresses)
   | Some _ -> failwith "removed root should be a branch node"
   | None -> failwith "removed root address should be stored");
   (match Hashtbl.find_opt memory "node-6" with
   | Some (Leaf values) ->
       assert_equal_list "changed leaf only drops the removed value"
         (irange 32 49 @ irange 51 63)
-        values
+        (Array.to_list values)
   | Some _ -> failwith "changed node should be a leaf"
   | None -> failwith "changed leaf address should be stored");
   assert_equal_list "removed stored set keeps sorted values"
@@ -1489,16 +1490,16 @@ let test_storage_remove_borrows_from_right_sibling () =
   assert_equal_list "rebalanced remove keeps sorted values" (irange 3 7)
     (to_list rebalanced_stored);
   match Hashtbl.find_opt memory rebalanced_root with
-  | Some (Branch (_, [ left_address; right_address ])) -> (
+  | Some (Branch (_, [| left_address; right_address |])) -> (
       match
         ( Hashtbl.find_opt memory left_address,
           Hashtbl.find_opt memory right_address )
       with
       | Some (Leaf left), Some (Leaf right) ->
           assert_equal_list "underfull left leaf borrows from right sibling"
-            [ 3; 4 ] left;
+            [ 3; 4 ] (Array.to_list left);
           assert_equal_list "right sibling keeps the remaining upper values"
-            [ 5; 6; 7 ] right
+            [ 5; 6; 7 ] (Array.to_list right)
       | _ -> failwith "rebalanced children should be leaves")
   | Some _ -> failwith "rebalanced root should keep two leaf children"
   | None -> failwith "rebalanced root should be stored"
@@ -1530,7 +1531,9 @@ let test_nested_storage_remove_borrows_branch_from_right_sibling () =
     (irange 12 63)
     (to_list rebalanced_stored);
   match Hashtbl.find_opt memory rebalanced_root with
-  | Some (Branch (_, first_branch :: second_branch :: _)) -> (
+  | Some (Branch (_, child_addresses)) when Array.length child_addresses >= 2 -> (
+      let first_branch = child_addresses.(0) in
+      let second_branch = child_addresses.(1) in
       match
         ( Hashtbl.find_opt memory first_branch,
           Hashtbl.find_opt memory second_branch )
@@ -1538,9 +1541,9 @@ let test_nested_storage_remove_borrows_branch_from_right_sibling () =
       | Some (Branch (first_keys, _)), Some (Branch (second_keys, _)) ->
           assert_equal_int
             "underfull branch borrows one child from right sibling" 2
-            (List.length first_keys);
+            (Array.length first_keys);
           assert_equal_int "right branch keeps the remaining children" 3
-            (List.length second_keys)
+            (Array.length second_keys)
       | _ -> failwith "rebalanced root children should be branches")
   | Some _ -> failwith "nested rebalanced root should be a branch"
   | None -> failwith "nested rebalanced root should be stored"
@@ -1578,7 +1581,7 @@ let test_storage_add_preserves_unchanged_leaf_addresses () =
   | Some (Branch (_, child_addresses)) ->
       assert_equal_list "added root points at reused sibling leaves"
         [ "node-1"; "node-6"; "node-7"; "node-3"; "node-4" ]
-        child_addresses
+        (Array.to_list child_addresses)
   | Some _ -> failwith "added root should be a branch node"
   | None -> failwith "added root address should be stored");
   (match
@@ -1586,9 +1589,9 @@ let test_storage_add_preserves_unchanged_leaf_addresses () =
    with
   | Some (Leaf left), Some (Leaf right) ->
       assert_equal_list "split left leaf contains the lower local values"
-        (irange 32 47) left;
+        (irange 32 47) (Array.to_list left);
       assert_equal_list "split right leaf contains the upper local values"
-        (irange 48 64) right
+        (irange 48 64) (Array.to_list right)
   | _ -> failwith "changed leaf should split into two new leaves");
   assert_equal_list "added stored set keeps sorted values" (irange 0 100)
     (to_list added_stored)
@@ -1979,11 +1982,11 @@ let test_restored_reverse_slice_avoids_branch_annotation_list () =
     List.map
       (fun value ->
         let address = "leaf-" ^ string_of_int value in
-        Hashtbl.add memory address (Leaf [ value ]);
+        Hashtbl.add memory address (Leaf [| value |]);
         address)
       keys
   in
-  Hashtbl.add memory "root" (Branch (keys, child_addresses));
+  Hashtbl.add memory "root" (Branch (Array.of_list keys, Array.of_list child_addresses));
   let storage =
     {
       store_node = (fun _ -> invalid_arg "test storage is read-only");
@@ -2199,29 +2202,29 @@ let test_storage_uses_nested_branch_nodes_for_very_large_sets () =
   (match Hashtbl.find_opt memory root with
   | Some (Branch (keys, child_addresses)) ->
       assert_equal_list "root branch stores intermediate max keys"
-        [ 1023; 1055 ] keys;
+        [ 1023; 1055 ] (Array.to_list keys);
       assert_equal_list "root branch points to intermediate branches"
-        [ "node-33"; "node-35" ] child_addresses
+        [ "node-33"; "node-35" ] (Array.to_list child_addresses)
   | Some _ -> failwith "very large root should be a branch node"
   | None -> failwith "very large root address should be stored");
   (match Hashtbl.find_opt memory "node-33" with
   | Some (Branch (keys, child_addresses)) ->
       assert_equal_list "first intermediate branch stores leaf max keys"
         (List.init 32 (fun index -> ((index + 1) * 32) - 1))
-        keys;
+        (Array.to_list keys);
       assert_equal_list
         "first intermediate branch points to the first leaf group"
         (List.init 32 (fun index -> "node-" ^ string_of_int (index + 1)))
-        child_addresses
+        (Array.to_list child_addresses)
   | Some _ -> failwith "first intermediate node should be a branch"
   | None -> failwith "first intermediate branch should be stored");
   (match Hashtbl.find_opt memory "node-35" with
   | Some (Branch (keys, child_addresses)) ->
       assert_equal_list
-        "second intermediate branch stores remaining leaf max key" [ 1055 ] keys;
+        "second intermediate branch stores remaining leaf max key" [ 1055 ] (Array.to_list keys);
       assert_equal_list
         "second intermediate branch points to the remaining leaf" [ "node-34" ]
-        child_addresses
+        (Array.to_list child_addresses)
   | Some _ -> failwith "second intermediate node should be a branch"
   | None -> failwith "second intermediate branch should be stored");
   (match restore ~cmp:compare storage root with
@@ -2311,9 +2314,9 @@ let test_nested_storage_remove_reuses_unchanged_branch_addresses () =
   (match Hashtbl.find_opt memory removed_root with
   | Some (Branch (keys, child_addresses)) ->
       assert_equal_list "nested remove root keeps old second branch max key"
-        [ 1023; 1055 ] keys;
+        [ 1023; 1055 ] (Array.to_list keys);
       assert_equal_list "nested remove root reuses unchanged second branch"
-        [ "node-38"; "node-35" ] child_addresses
+        [ "node-38"; "node-35" ] (Array.to_list child_addresses)
   | Some _ -> failwith "nested remove root should be a branch"
   | None -> failwith "nested remove root should be stored");
   (match Hashtbl.find_opt memory "node-38" with
@@ -2323,7 +2326,7 @@ let test_nested_storage_remove_reuses_unchanged_branch_addresses () =
             if index = 1 then "node-37" else "node-" ^ string_of_int (index + 1))
       in
       assert_equal_list "nested remove rewrites only the changed leaf address"
-        expected child_addresses
+        expected (Array.to_list child_addresses)
   | Some _ -> failwith "nested remove first branch should be a branch"
   | None -> failwith "nested remove changed branch should be stored");
   assert_equal_list "nested remove keeps sorted values"
@@ -2377,10 +2380,10 @@ let test_restored_nested_remove_reuses_unchanged_branch_addresses_lazily () =
   | Some (Branch (keys, child_addresses)) ->
       assert_equal_list
         "restored nested remove root keeps old second branch max key"
-        [ 1023; 1055 ] keys;
+        [ 1023; 1055 ] (Array.to_list keys);
       assert_equal_list
         "restored nested remove root reuses unchanged second branch"
-        [ "node-38"; "node-35" ] child_addresses
+        [ "node-38"; "node-35" ] (Array.to_list child_addresses)
   | Some _ -> failwith "restored nested remove root should be a branch"
   | None -> failwith "restored nested remove root should be stored");
   assert_equal_list "restored nested remove keeps sorted values"
@@ -2435,11 +2438,11 @@ let test_restored_nested_add_reuses_unchanged_branch_addresses_lazily () =
   | Some (Branch (keys, child_addresses)) ->
       assert_equal_list
         "restored nested add root updates split first branch max keys"
-        [ 480; 1024; 1055 ] keys;
+        [ 480; 1024; 1055 ] (Array.to_list keys);
       assert_equal_list
         "restored nested add root reuses unchanged second branch"
         [ "node-39"; "node-40"; "node-35" ]
-        child_addresses
+        (Array.to_list child_addresses)
   | Some _ -> failwith "restored nested add root should be a branch"
   | None -> failwith "restored nested add root should be stored");
   assert_equal_list "restored nested add keeps sorted values" (irange 0 1055)

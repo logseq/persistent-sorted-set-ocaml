@@ -30,8 +30,9 @@ let irange from_ to_ =
   loop [] to_
 
 let copy_stored_node = function
-  | Leaf values -> Leaf values
-  | Branch (keys, child_addresses) -> Branch (keys, child_addresses)
+  | Leaf values -> Leaf (Array.copy values)
+  | Branch (keys, child_addresses) ->
+      Branch (Array.copy keys, Array.copy child_addresses)
 
 let set_timeout f milliseconds =
   ignore
