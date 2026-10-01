@@ -63,11 +63,18 @@ val seek : 'a -> 'a seq -> 'a seq
 val store : 'a t -> string * 'a t
 
 val restore :
+  ?count:int ->
   ?cmp:'a comparator ->
   ?settings:settings ->
   'a storage ->
   string ->
   'a t option
+(** [restore ~count storage address] restores a set lazily with its known
+    cardinality. [count] must be the exact number of elements in the snapshot at
+    [address], before any later edits. The caller is responsible for this
+    consistency: restore does not read nodes to verify it. Negative counts are
+    rejected. Without [count], cardinality is computed by traversing the set
+    when [count set] is called, preserving the existing restore behavior. *)
 
 (* DEBUG vals *)
 val validate_invariants : 'a t -> unit
