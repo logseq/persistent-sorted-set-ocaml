@@ -1889,8 +1889,12 @@ let store set =
       let address = storage.store_node (Leaf []) in
       (address, stored_set address)
 
-let restore ?(cmp = default_cmp) ?(settings = default_settings) storage address
-    =
+let restore ?count ?(cmp = default_cmp) ?(settings = default_settings) storage
+    address =
+  (match count with
+  | Some count when count < 0 ->
+      invalid_arg "restore count must be non-negative"
+  | Some _ | None -> ());
   let settings = validate_settings settings in
   Some
     {
@@ -1898,5 +1902,5 @@ let restore ?(cmp = default_cmp) ?(settings = default_settings) storage address
       set_settings = settings;
       set_storage = Some (cache_storage settings storage);
       data = Deferred { address };
-      count_cache = None;
+      count_cache = count;
     }

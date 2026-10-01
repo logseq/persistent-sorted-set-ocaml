@@ -1282,6 +1282,81 @@ let test_stored_count_uses_cached_size () =
   assert_equal_list "edited stored count should not mark stored nodes accessed"
     [] !accessed
 
+let count_restore_fixture values =
+  let nodes = Hashtbl.create 64 in
+  let writes = ref 0 and reads = ref 0 in
+  let storage =
+    {
+      store_node =
+        (fun node ->
+          incr writes;
+          let address = string_of_int !writes in
+          Hashtbl.replace nodes address node;
+          address);
+      restore_node =
+        (fun address ->
+          incr reads;
+          Hashtbl.find_opt nodes address);
+      accessed = (fun _ -> ());
+    }
+  in
+  let settings = { branching_factor = 4; ref_type = Strong } in
+  let root, _ = Pss.store (Pss.of_list_by ~settings ~storage values) in
+  (settings, storage, root, reads)
+
+let test_restore_known_count_is_lazy_and_tracks_edits () =
+  let settings, storage, root, reads =
+    count_restore_fixture (List.init 4096 Fun.id)
+  in
+  let restored = Option.get (Pss.restore ~count:4096 ~settings storage root) in
+  assert_equal_int "known-count restore is lazy" 0 !reads;
+  List.iter
+    (fun _ ->
+      assert_equal_int "known restored count" 4096 (Pss.count restored);
+      assert_equal_int "repeated count does not read nodes" 0 !reads)
+    [ 1; 2 ];
+  let added = Pss.add 4096 restored in
+  let after_edit = !reads in
+  assert_equal_int "cached add count" 4097 (Pss.count added);
+  assert_equal_int "count after add does not read nodes" after_edit !reads;
+  let duplicate = Pss.add 4096 added in
+  let missing = Pss.remove (-1) duplicate in
+  let removed = Pss.remove 10 missing in
+  let after_edit = !reads in
+  assert_equal_int "duplicate and missing deletion preserve count" 4097
+    (Pss.count missing);
+  assert_equal_int "successful deletion decrements count" 4096
+    (Pss.count removed);
+  assert_equal_int "edit counts do not read nodes" after_edit !reads;
+  assert_equal_int "persistent original count" 4096 (Pss.count restored)
+
+let test_restore_known_count_empty_and_invalid () =
+  let settings, storage, root, reads = count_restore_fixture [] in
+  let restored = Option.get (Pss.restore ~count:0 ~settings storage root) in
+  assert_equal_int "empty restored count" 0 (Pss.count restored);
+  assert_equal_int "empty count does not read nodes" 0 !reads;
+  let absent = Pss.remove 1 restored in
+  assert_equal_int "delete from empty count" 0 (Pss.count absent);
+  let singleton = Pss.add 1 absent in
+  assert_equal_int "add to restored empty count" 1 (Pss.count singleton);
+  assert_equal_int "remove singleton count" 0
+    (Pss.count (Pss.remove 1 singleton));
+  let before = !reads in
+  assert_raises_invalid_arg "negative known count" (fun () ->
+      ignore (Pss.restore ~count:(-1) ~settings storage root));
+  assert_equal_int "invalid count validation does not read nodes" before !reads
+
+let test_restore_without_count_remains_compatible () =
+  let settings, storage, root, reads =
+    count_restore_fixture (List.init 100 Fun.id)
+  in
+  let restored = Option.get (Pss.restore ~settings storage root) in
+  assert_equal_int "legacy restore remains lazy" 0 !reads;
+  assert_equal_int "legacy restore computes actual count" 100
+    (Pss.count restored);
+  if !reads = 0 then failwith "legacy count should load stored nodes";
+  assert_equal_int "legacy edited count" 99 (Pss.count (Pss.remove 10 restored))
+
 let test_storage_uses_leaf_and_branch_nodes_for_large_sets () =
   let memory = Hashtbl.create 16 in
   let writes = ref 0 in
@@ -2442,6 +2517,9 @@ let () =
   test_upstream_overflow_batched_insert_smoke ();
   test_storage_round_trip_and_stable_addresses ();
   test_stored_count_uses_cached_size ();
+  test_restore_known_count_is_lazy_and_tracks_edits ();
+  test_restore_known_count_empty_and_invalid ();
+  test_restore_without_count_remains_compatible ();
   test_storage_uses_leaf_and_branch_nodes_for_large_sets ();
   test_storage_remove_preserves_unchanged_leaf_addresses ();
   test_storage_remove_borrows_from_right_sibling ();

@@ -11,6 +11,7 @@ let require_equal_list label actual expected =
 let () =
   let memory = Hashtbl.create 8 in
   let next_id = ref 0 in
+  let reads = ref 0 in
   let storage =
     {
       PSet.store_node =
@@ -19,14 +20,20 @@ let () =
           let address = "node-" ^ string_of_int !next_id in
           Hashtbl.replace memory address node;
           address);
-      restore_node = (fun address -> Hashtbl.find_opt memory address);
+      restore_node =
+        (fun address ->
+          incr reads;
+          Hashtbl.find_opt memory address);
       accessed = (fun _address -> ());
     }
   in
   let set = PSet.of_list_by ~storage [ 3; 1; 2 ] in
   let root, _stored = PSet.store set in
-  match PSet.restore storage root with
+  match PSet.restore ~count:3 storage root with
   | None -> failwith "expected stored set to restore"
   | Some restored ->
-      require_equal_list "restored Melange stored set"
-        (PSet.to_list restored) [ 1; 2; 3 ]
+      if PSet.count restored <> 3 || PSet.count restored <> 3 then
+        failwith "restored Melange count differs";
+      if !reads <> 0 then failwith "known Melange count loaded nodes";
+      require_equal_list "restored Melange stored set" (PSet.to_list restored)
+        [ 1; 2; 3 ]
