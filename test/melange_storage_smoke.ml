@@ -15,9 +15,9 @@ let () =
   let storage =
     {
       PSet.store_node =
-        (fun node ->
+        (fun ?address:given_address node ->
           incr next_id;
-          let address = "node-" ^ string_of_int !next_id in
+          let address = match given_address with Some a -> a | None -> "node-" ^ string_of_int !next_id in
           Hashtbl.replace memory address node;
           address);
       restore_node =

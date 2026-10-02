@@ -151,9 +151,9 @@ let roundtrip_set set =
   let storage =
     {
       store_node =
-        (fun node ->
+        (fun ?address:given_address node ->
           incr writes;
-          let address = "node-" ^ string_of_int !writes in
+          let address = match given_address with Some a -> a | None -> "node-" ^ string_of_int !writes in
           Hashtbl.replace memory address node;
           address);
       restore_node = (fun address -> Hashtbl.find_opt memory address);
@@ -232,9 +232,9 @@ let test_show_node_tree_string () =
   let storage =
     {
       store_node =
-        (fun node ->
+        (fun ?address:given_address node ->
           incr writes;
-          let address = "node-" ^ string_of_int !writes in
+          let address = match given_address with Some a -> a | None -> "node-" ^ string_of_int !writes in
           Hashtbl.replace memory address node;
           address);
       restore_node = (fun address -> Hashtbl.find_opt memory address);
@@ -253,10 +253,10 @@ let test_show_node_tree_string () =
   let edited_root = root_node_exn "edited stored show_node" (add 10 stored) in
   assert_equal_string
     "show_node renders storage refs without materializing them"
-    "Branch(address=none keys=[3; 7; 10])\n\
+    "Branch(address=node-4 keys=[3; 7; 10])\n\
     \  Ref(address=node-1 max_key=3)\n\
     \  Ref(address=node-2 max_key=7)\n\
-    \  Leaf(address=none len=3 values=[8; 9; 10])"
+    \  Leaf(address=node-3 len=3 values=[8; 9; 10])"
     (show_node string_of_int edited_root)
 
 let test_store_preserves_memory_tree_shape () =
@@ -265,9 +265,9 @@ let test_store_preserves_memory_tree_shape () =
   let storage =
     {
       store_node =
-        (fun node ->
+        (fun ?address:given_address node ->
           incr writes;
-          let address = "node-" ^ string_of_int !writes in
+          let address = match given_address with Some a -> a | None -> "node-" ^ string_of_int !writes in
           Hashtbl.replace memory address node;
           address);
       restore_node = (fun address -> Hashtbl.find_opt memory address);
@@ -314,9 +314,9 @@ let test_restored_add_uses_balanced_leaf_split () =
   let storage =
     {
       store_node =
-        (fun node ->
+        (fun ?address:given_address node ->
           incr writes;
-          let address = "node-" ^ string_of_int !writes in
+          let address = match given_address with Some a -> a | None -> "node-" ^ string_of_int !writes in
           Hashtbl.replace memory address node;
           address);
       restore_node = (fun address -> Hashtbl.find_opt memory address);
@@ -341,10 +341,10 @@ let test_restored_add_uses_balanced_leaf_split () =
         (Array.to_list keys);
       assert_equal_string_list
         "balanced restored add reuses unchanged left leaf"
-        [ "node-1"; "node-4"; "node-5" ]
+        [ "node-1"; "node-2"; "node-5" ]
         (Array.to_list child_addresses);
       match
-        (Hashtbl.find_opt memory "node-4", Hashtbl.find_opt memory "node-5")
+        (Hashtbl.find_opt memory "node-2", Hashtbl.find_opt memory "node-5")
       with
       | Some (Leaf left), Some (Leaf right) ->
           assert_equal_list "balanced restored add left split leaf" [ 4; 5 ]
@@ -360,8 +360,8 @@ let test_storage_backed_pure_trees_do_not_rescan_before_edits () =
     let memory = Hashtbl.create 16 in
     {
       store_node =
-        (fun node ->
-          let address = "node-" ^ string_of_int (Hashtbl.length memory) in
+        (fun ?address:given_address node ->
+          let address = match given_address with Some a -> a | None -> "node-" ^ string_of_int (Hashtbl.length memory) in
           Hashtbl.replace memory address node;
           address);
       restore_node = (fun address -> Hashtbl.find_opt memory address);
@@ -447,9 +447,9 @@ let test_settings_control_storage_branching_factor () =
   let storage =
     {
       store_node =
-        (fun node ->
+        (fun ?address:given_address node ->
           incr writes;
-          let address = "node-" ^ string_of_int !writes in
+          let address = match given_address with Some a -> a | None -> "node-" ^ string_of_int !writes in
           Hashtbl.replace memory address node;
           address);
       restore_node = (fun address -> Hashtbl.find_opt memory address);
@@ -498,9 +498,9 @@ let test_restore_preserves_settings_for_later_edits () =
   let storage =
     {
       store_node =
-        (fun node ->
+        (fun ?address:given_address node ->
           incr writes;
-          let address = "node-" ^ string_of_int !writes in
+          let address = match given_address with Some a -> a | None -> "node-" ^ string_of_int !writes in
           Hashtbl.replace memory address node;
           address);
       restore_node =
@@ -542,12 +542,12 @@ let test_restore_preserves_settings_for_later_edits () =
     "custom restored add reuses unchanged leaves and stores split branch levels"
     [
       added_root;
-      "node-6";
+      "node-5";
       "node-1";
       "node-2";
       "node-9";
       "node-3";
-      "node-7";
+      "node-4";
       "node-8";
     ]
     (stored_addresses memory added_root);
@@ -557,7 +557,7 @@ let test_restore_preserves_settings_for_later_edits () =
         [ 7; 16 ] (Array.to_list keys);
       assert_equal_list
         "custom restored add root addresses point at split branch nodes"
-        [ "node-6"; "node-9" ] (Array.to_list child_addresses)
+        [ "node-5"; "node-9" ] (Array.to_list child_addresses)
   | Some _ -> failwith "custom restored add root should be a branch"
   | None -> failwith "custom restored add root should be stored"
 
@@ -568,9 +568,9 @@ let test_ref_type_controls_restored_node_cache () =
   let storage =
     {
       store_node =
-        (fun node ->
+        (fun ?address:given_address node ->
           incr writes;
-          let address = "node-" ^ string_of_int !writes in
+          let address = match given_address with Some a -> a | None -> "node-" ^ string_of_int !writes in
           Hashtbl.replace memory address (Marshal.to_string node []);
           address);
       restore_node =
@@ -631,9 +631,9 @@ let test_reclaimable_ref_types_release_restored_nodes_after_gc () =
     let storage =
       {
         store_node =
-          (fun node ->
+          (fun ?address:given_address node ->
             incr writes;
-            let address = "node-" ^ string_of_int !writes in
+            let address = match given_address with Some a -> a | None -> "node-" ^ string_of_int !writes in
             Hashtbl.replace memory address node;
             address);
         restore_node =
@@ -685,7 +685,7 @@ let test_settings_validate_branching_factor () =
   let storage =
     {
       store_node =
-        (fun node ->
+        (fun ?address:_given_address node ->
           Hashtbl.replace memory "root" node;
           "root");
       restore_node = (fun address -> Hashtbl.find_opt memory address);
@@ -705,9 +705,9 @@ let test_of_sorted_array_uses_sorted_input_and_settings () =
   let storage =
     {
       store_node =
-        (fun node ->
+        (fun ?address:given_address node ->
           incr writes;
-          let address = "node-" ^ string_of_int !writes in
+          let address = match given_address with Some a -> a | None -> "node-" ^ string_of_int !writes in
           Hashtbl.replace memory address node;
           address);
       restore_node = (fun address -> Hashtbl.find_opt memory address);
@@ -838,9 +838,9 @@ let test_restored_equal_comparator_slice_ranges () =
   let storage =
     {
       store_node =
-        (fun node ->
+        (fun ?address:given_address node ->
           incr writes;
-          let address = "node-" ^ string_of_int !writes in
+          let address = match given_address with Some a -> a | None -> "node-" ^ string_of_int !writes in
           Hashtbl.replace memory address node;
           address);
       restore_node = (fun address -> Hashtbl.find_opt memory address);
@@ -1200,9 +1200,9 @@ let test_storage_round_trip_and_stable_addresses () =
   let storage =
     {
       store_node =
-        (fun node ->
+        (fun ?address:given_address node ->
           incr writes;
-          let address = "node-" ^ string_of_int !writes in
+          let address = match given_address with Some a -> a | None -> "node-" ^ string_of_int !writes in
           Hashtbl.replace memory address node;
           address);
       restore_node =
@@ -1235,10 +1235,10 @@ let test_storage_round_trip_and_stable_addresses () =
     [ root ] !accessed;
   let changed = add 101 stored_again in
   let changed_root, changed_stored = store changed in
-  if changed_root = root then
-    failwith "modified stored set should get a new root address";
-  assert_equal_int "modified set writes a new root" 2 !writes;
-  assert_equal_list "stored_addresses reports the new root" [ changed_root ]
+  if changed_root <> root then
+    failwith "modified stored set should rewrite its root in place";
+  assert_equal_int "modified set rewrites the root in place" 2 !writes;
+  assert_equal_list "stored_addresses reports the rewritten root" [ root ]
     (stored_addresses memory changed_root);
   let duplicate = add 101 changed_stored in
   let duplicate_root, _ = store duplicate in
@@ -1254,9 +1254,9 @@ let test_stored_count_uses_cached_size () =
   let storage =
     {
       store_node =
-        (fun node ->
+        (fun ?address:given_address node ->
           incr writes;
-          let address = "node-" ^ string_of_int !writes in
+          let address = match given_address with Some a -> a | None -> "node-" ^ string_of_int !writes in
           Hashtbl.replace memory address node;
           address);
       restore_node =
@@ -1289,9 +1289,9 @@ let count_restore_fixture values =
   let storage =
     {
       store_node =
-        (fun node ->
+        (fun ?address:given_address node ->
           incr writes;
-          let address = string_of_int !writes in
+          let address = match given_address with Some a -> a | None -> string_of_int !writes in
           Hashtbl.replace nodes address node;
           address);
       restore_node =
@@ -1366,9 +1366,9 @@ let test_storage_uses_leaf_and_branch_nodes_for_large_sets () =
   let storage =
     {
       store_node =
-        (fun node ->
+        (fun ?address:given_address node ->
           incr writes;
-          let address = "node-" ^ string_of_int !writes in
+          let address = match given_address with Some a -> a | None -> "node-" ^ string_of_int !writes in
           Hashtbl.replace memory address node;
           address);
       restore_node =
@@ -1407,16 +1407,17 @@ let test_storage_uses_leaf_and_branch_nodes_for_large_sets () =
     !accessed;
   let appended = add 101 stored in
   let appended_root, _ = store appended in
-  if appended_root = root then
-    failwith "appending to a stored set should create a new root";
-  assert_equal_int "append writes one changed leaf and one new branch" 7 !writes;
+  if appended_root <> root then
+    failwith "appending to a stored set should rewrite its root in place";
+  assert_equal_int "append rewrites one leaf and the root branch in place" 7
+    !writes;
   assert_equal_list "append reuses unchanged leaf addresses"
-    [ appended_root; "node-1"; "node-2"; "node-3"; "node-6" ]
+    [ root; "node-1"; "node-2"; "node-3"; "node-4" ]
     (stored_addresses memory appended_root);
   match Hashtbl.find_opt memory appended_root with
   | Some (Branch (_, child_addresses)) ->
       assert_equal_list "appended root reuses unchanged leaves"
-        [ "node-1"; "node-2"; "node-3"; "node-6" ]
+        [ "node-1"; "node-2"; "node-3"; "node-4" ]
         (Array.to_list child_addresses)
   | Some _ -> failwith "appended root should be a branch node"
   | None -> failwith "appended root address should be stored"
@@ -1427,9 +1428,9 @@ let test_storage_remove_preserves_unchanged_leaf_addresses () =
   let storage =
     {
       store_node =
-        (fun node ->
+        (fun ?address:given_address node ->
           incr writes;
-          let address = "node-" ^ string_of_int !writes in
+          let address = match given_address with Some a -> a | None -> "node-" ^ string_of_int !writes in
           Hashtbl.replace memory address node;
           address);
       restore_node = (fun address -> Hashtbl.find_opt memory address);
@@ -1441,21 +1442,21 @@ let test_storage_remove_preserves_unchanged_leaf_addresses () =
   assert_equal_int "large store writes leaf nodes plus a root" 5 !writes;
   let removed = remove 50 stored in
   let removed_root, removed_stored = store removed in
-  if removed_root = root then
-    failwith "removing a value should create a new root address";
+  if removed_root <> root then
+    failwith "removing a value should rewrite the root in place";
   assert_equal_int "removing from one leaf rewrites one leaf and one root" 7
     !writes;
-  assert_equal_list "remove reuses unaffected leaf addresses"
-    [ removed_root; "node-1"; "node-6"; "node-3"; "node-4" ]
+  assert_equal_list "remove reuses unchanged leaf addresses"
+    [ root; "node-1"; "node-2"; "node-3"; "node-4" ]
     (stored_addresses memory removed_root);
   (match Hashtbl.find_opt memory removed_root with
   | Some (Branch (_, child_addresses)) ->
-      assert_equal_list "removed root points at reused sibling leaves"
-        [ "node-1"; "node-6"; "node-3"; "node-4" ]
+      assert_equal_list "removed root points at unchanged sibling leaves"
+        [ "node-1"; "node-2"; "node-3"; "node-4" ]
         (Array.to_list child_addresses)
   | Some _ -> failwith "removed root should be a branch node"
   | None -> failwith "removed root address should be stored");
-  (match Hashtbl.find_opt memory "node-6" with
+  (match Hashtbl.find_opt memory "node-2" with
   | Some (Leaf values) ->
       assert_equal_list "changed leaf only drops the removed value"
         (irange 32 49 @ irange 51 63)
@@ -1472,9 +1473,9 @@ let test_storage_remove_borrows_from_right_sibling () =
   let storage =
     {
       store_node =
-        (fun node ->
+        (fun ?address:given_address node ->
           incr writes;
-          let address = "node-" ^ string_of_int !writes in
+          let address = match given_address with Some a -> a | None -> "node-" ^ string_of_int !writes in
           Hashtbl.replace memory address node;
           address);
       restore_node = (fun address -> Hashtbl.find_opt memory address);
@@ -1510,9 +1511,9 @@ let test_nested_storage_remove_borrows_branch_from_right_sibling () =
   let storage =
     {
       store_node =
-        (fun node ->
+        (fun ?address:given_address node ->
           incr writes;
-          let address = "node-" ^ string_of_int !writes in
+          let address = match given_address with Some a -> a | None -> "node-" ^ string_of_int !writes in
           Hashtbl.replace memory address node;
           address);
       restore_node = (fun address -> Hashtbl.find_opt memory address);
@@ -1554,9 +1555,9 @@ let test_storage_add_preserves_unchanged_leaf_addresses () =
   let storage =
     {
       store_node =
-        (fun node ->
+        (fun ?address:given_address node ->
           incr writes;
-          let address = "node-" ^ string_of_int !writes in
+          let address = match given_address with Some a -> a | None -> "node-" ^ string_of_int !writes in
           Hashtbl.replace memory address node;
           address);
       restore_node = (fun address -> Hashtbl.find_opt memory address);
@@ -1570,22 +1571,22 @@ let test_storage_add_preserves_unchanged_leaf_addresses () =
   assert_equal_int "large gapped store writes leaf nodes plus a root" 5 !writes;
   let added = add 50 stored in
   let added_root, added_stored = store added in
-  if added_root = root then
-    failwith "adding a value should create a new root address";
+  if added_root <> root then
+    failwith "adding a value should rewrite the root in place";
   assert_equal_int
     "adding into one full leaf rewrites split leaves and one root" 8 !writes;
   assert_equal_list "add reuses unaffected leaf addresses"
-    [ added_root; "node-1"; "node-6"; "node-7"; "node-3"; "node-4" ]
+    [ root; "node-1"; "node-2"; "node-7"; "node-3"; "node-4" ]
     (stored_addresses memory added_root);
   (match Hashtbl.find_opt memory added_root with
   | Some (Branch (_, child_addresses)) ->
       assert_equal_list "added root points at reused sibling leaves"
-        [ "node-1"; "node-6"; "node-7"; "node-3"; "node-4" ]
+        [ "node-1"; "node-2"; "node-7"; "node-3"; "node-4" ]
         (Array.to_list child_addresses)
   | Some _ -> failwith "added root should be a branch node"
   | None -> failwith "added root address should be stored");
   (match
-     (Hashtbl.find_opt memory "node-6", Hashtbl.find_opt memory "node-7")
+     (Hashtbl.find_opt memory "node-2", Hashtbl.find_opt memory "node-7")
    with
   | Some (Leaf left), Some (Leaf right) ->
       assert_equal_list "split left leaf contains the lower local values"
@@ -1604,9 +1605,9 @@ let test_restored_add_preserves_unchanged_leaf_addresses_lazily () =
   let storage =
     {
       store_node =
-        (fun node ->
+        (fun ?address:given_address node ->
           incr writes;
-          let address = "node-" ^ string_of_int !writes in
+          let address = match given_address with Some a -> a | None -> "node-" ^ string_of_int !writes in
           Hashtbl.replace memory address node;
           address);
       restore_node =
@@ -1630,11 +1631,12 @@ let test_restored_add_preserves_unchanged_leaf_addresses_lazily () =
   assert_equal_list "restored add should access only root and target leaf"
     [ "node-4"; root ] !accessed;
   let appended_root, appended_stored = store appended in
-  if appended_root = root then failwith "restored add should create a new root";
-  assert_equal_int "restored add should write one changed leaf and one new root"
-    7 !writes;
+  if appended_root <> root then
+    failwith "restored add should rewrite the root in place";
+  assert_equal_int
+    "restored add should rewrite one changed leaf and the root" 7 !writes;
   assert_equal_list "restored add reuses unchanged leaf addresses"
-    [ appended_root; "node-1"; "node-2"; "node-3"; "node-6" ]
+    [ root; "node-1"; "node-2"; "node-3"; "node-4" ]
     (stored_addresses memory appended_root);
   assert_equal_list "restored add keeps sorted values" (irange 0 101)
     (to_list appended_stored)
@@ -1647,9 +1649,9 @@ let test_chained_restored_adds_keep_edit_path_without_rebuilding () =
   let storage =
     {
       store_node =
-        (fun node ->
+        (fun ?address:given_address node ->
           incr writes;
-          let address = "node-" ^ string_of_int !writes in
+          let address = match given_address with Some a -> a | None -> "node-" ^ string_of_int !writes in
           Hashtbl.replace memory address node;
           address);
       restore_node =
@@ -1686,13 +1688,13 @@ let test_chained_restored_adds_keep_edit_path_without_rebuilding () =
   assert_equal_list "duplicate add should not access stored siblings" []
     !accessed;
   let appended_root, appended_stored = store appended_duplicate in
-  if appended_root = root then
-    failwith "chained restored adds should create a new root";
+  if appended_root <> root then
+    failwith "chained restored adds should rewrite the root in place";
   assert_equal_int
-    "chained restored adds should write one final leaf and one new root" 7
+    "chained restored adds should rewrite one final leaf and the root" 7
     !writes;
   assert_equal_list "chained restored adds reuse unchanged leaf addresses"
-    [ appended_root; "node-1"; "node-2"; "node-3"; "node-6" ]
+    [ root; "node-1"; "node-2"; "node-3"; "node-4" ]
     (stored_addresses memory appended_root);
   assert_equal_list "chained restored adds keep sorted values" (irange 0 102)
     (to_list appended_stored)
@@ -1705,9 +1707,9 @@ let test_restored_remove_preserves_unchanged_leaf_addresses_lazily () =
   let storage =
     {
       store_node =
-        (fun node ->
+        (fun ?address:given_address node ->
           incr writes;
-          let address = "node-" ^ string_of_int !writes in
+          let address = match given_address with Some a -> a | None -> "node-" ^ string_of_int !writes in
           Hashtbl.replace memory address node;
           address);
       restore_node =
@@ -1732,12 +1734,12 @@ let test_restored_remove_preserves_unchanged_leaf_addresses_lazily () =
   assert_equal_list "restored remove should access only root and target leaf"
     [ "node-2"; root ] !accessed;
   let removed_root, removed_stored = store removed in
-  if removed_root = root then
-    failwith "restored remove should create a new root";
+  if removed_root <> root then
+    failwith "restored remove should rewrite the root in place";
   assert_equal_int
-    "restored remove should write one changed leaf and one new root" 7 !writes;
+    "restored remove should rewrite one changed leaf and the root" 7 !writes;
   assert_equal_list "restored remove reuses unchanged leaf addresses"
-    [ removed_root; "node-1"; "node-6"; "node-3"; "node-4" ]
+    [ root; "node-1"; "node-2"; "node-3"; "node-4" ]
     (stored_addresses memory removed_root);
   assert_equal_list "restored remove keeps sorted values"
     (irange 0 49 @ irange 51 100)
@@ -1751,9 +1753,9 @@ let test_restored_mem_reads_only_needed_leaves () =
   let storage =
     {
       store_node =
-        (fun node ->
+        (fun ?address:given_address node ->
           incr writes;
-          let address = "node-" ^ string_of_int !writes in
+          let address = match given_address with Some a -> a | None -> "node-" ^ string_of_int !writes in
           Hashtbl.replace memory address node;
           address);
       restore_node =
@@ -1805,9 +1807,9 @@ let test_restored_tree_refs_cache_repeated_access () =
   let storage =
     {
       store_node =
-        (fun node ->
+        (fun ?address:given_address node ->
           incr writes;
-          let address = "node-" ^ string_of_int !writes in
+          let address = match given_address with Some a -> a | None -> "node-" ^ string_of_int !writes in
           Hashtbl.replace memory address node;
           address);
       restore_node =
@@ -1851,9 +1853,9 @@ let test_restored_mem_uses_binary_search_inside_stored_nodes () =
   let storage =
     {
       store_node =
-        (fun node ->
+        (fun ?address:given_address node ->
           incr writes;
-          let address = "node-" ^ string_of_int !writes in
+          let address = match given_address with Some a -> a | None -> "node-" ^ string_of_int !writes in
           Hashtbl.replace memory address node;
           address);
       restore_node = (fun address -> Hashtbl.find_opt memory address);
@@ -1886,9 +1888,9 @@ let test_restored_slice_reads_only_overlapping_leaves () =
   let storage =
     {
       store_node =
-        (fun node ->
+        (fun ?address:given_address node ->
           incr writes;
-          let address = "node-" ^ string_of_int !writes in
+          let address = match given_address with Some a -> a | None -> "node-" ^ string_of_int !writes in
           Hashtbl.replace memory address node;
           address);
       restore_node =
@@ -1933,9 +1935,9 @@ let test_restored_reverse_slice_reads_only_overlapping_leaves () =
   let storage =
     {
       store_node =
-        (fun node ->
+        (fun ?address:given_address node ->
           incr writes;
-          let address = "node-" ^ string_of_int !writes in
+          let address = match given_address with Some a -> a | None -> "node-" ^ string_of_int !writes in
           Hashtbl.replace memory address node;
           address);
       restore_node =
@@ -1989,7 +1991,7 @@ let test_restored_reverse_slice_avoids_branch_annotation_list () =
   Hashtbl.add memory "root" (Branch (Array.of_list keys, Array.of_list child_addresses));
   let storage =
     {
-      store_node = (fun _ -> invalid_arg "test storage is read-only");
+      store_node = (fun ?address:_ _ -> invalid_arg "test storage is read-only");
       restore_node = (fun address -> Hashtbl.find_opt memory address);
       accessed = (fun _ -> ());
     }
@@ -2018,9 +2020,9 @@ let test_restored_seq_seek_is_lazy () =
   let storage =
     {
       store_node =
-        (fun node ->
+        (fun ?address:given_address node ->
           incr writes;
-          let address = "node-" ^ string_of_int !writes in
+          let address = match given_address with Some a -> a | None -> "node-" ^ string_of_int !writes in
           Hashtbl.replace memory address node;
           address);
       restore_node =
@@ -2057,9 +2059,9 @@ let test_restored_rseq_seek_is_lazy () =
   let storage =
     {
       store_node =
-        (fun node ->
+        (fun ?address:given_address node ->
           incr writes;
-          let address = "node-" ^ string_of_int !writes in
+          let address = match given_address with Some a -> a | None -> "node-" ^ string_of_int !writes in
           Hashtbl.replace memory address node;
           address);
       restore_node =
@@ -2096,9 +2098,9 @@ let test_restored_slice_seq_construction_is_lazy () =
   let storage =
     {
       store_node =
-        (fun node ->
+        (fun ?address:given_address node ->
           incr writes;
-          let address = "node-" ^ string_of_int !writes in
+          let address = match given_address with Some a -> a | None -> "node-" ^ string_of_int !writes in
           Hashtbl.replace memory address node;
           address);
       restore_node =
@@ -2138,9 +2140,9 @@ let test_restored_rslice_seq_construction_is_lazy () =
   let storage =
     {
       store_node =
-        (fun node ->
+        (fun ?address:given_address node ->
           incr writes;
-          let address = "node-" ^ string_of_int !writes in
+          let address = match given_address with Some a -> a | None -> "node-" ^ string_of_int !writes in
           Hashtbl.replace memory address node;
           address);
       restore_node =
@@ -2178,9 +2180,9 @@ let test_storage_uses_nested_branch_nodes_for_very_large_sets () =
   let storage =
     {
       store_node =
-        (fun node ->
+        (fun ?address:given_address node ->
           incr writes;
-          let address = "node-" ^ string_of_int !writes in
+          let address = match given_address with Some a -> a | None -> "node-" ^ string_of_int !writes in
           Hashtbl.replace memory address node;
           address);
       restore_node =
@@ -2244,9 +2246,9 @@ let test_storage_addresses_visit_stored_descendants () =
     let storage =
       {
         store_node =
-          (fun node ->
+          (fun ?address:given_address node ->
             incr writes;
-            let address = "node-" ^ string_of_int !writes in
+            let address = match given_address with Some a -> a | None -> "node-" ^ string_of_int !writes in
             Hashtbl.replace memory address node;
             address);
         restore_node =
@@ -2291,9 +2293,9 @@ let test_nested_storage_remove_reuses_unchanged_branch_addresses () =
   let storage =
     {
       store_node =
-        (fun node ->
+        (fun ?address:given_address node ->
           incr writes;
-          let address = "node-" ^ string_of_int !writes in
+          let address = match given_address with Some a -> a | None -> "node-" ^ string_of_int !writes in
           Hashtbl.replace memory address node;
           address);
       restore_node = (fun address -> Hashtbl.find_opt memory address);
@@ -2305,27 +2307,24 @@ let test_nested_storage_remove_reuses_unchanged_branch_addresses () =
   if root <> "node-36" then failwith "initial nested root should be node-36";
   let removed = remove 50 stored in
   let removed_root, removed_stored = store removed in
-  if removed_root = root then
-    failwith "nested remove should create a new root address";
+  if removed_root <> root then
+    failwith "nested remove should rewrite the root in place";
   assert_equal_int "nested remove rewrites changed leaf, one branch, and root"
     39 !writes;
-  if removed_root <> "node-39" then
-    failwith "nested remove root should be the third new node";
   (match Hashtbl.find_opt memory removed_root with
   | Some (Branch (keys, child_addresses)) ->
       assert_equal_list "nested remove root keeps old second branch max key"
         [ 1023; 1055 ] (Array.to_list keys);
-      assert_equal_list "nested remove root reuses unchanged second branch"
-        [ "node-38"; "node-35" ] (Array.to_list child_addresses)
+      assert_equal_string_list "nested remove root reuses both branch addresses"
+        [ "node-33"; "node-35" ] (Array.to_list child_addresses)
   | Some _ -> failwith "nested remove root should be a branch"
   | None -> failwith "nested remove root should be stored");
-  (match Hashtbl.find_opt memory "node-38" with
+  (match Hashtbl.find_opt memory "node-33" with
   | Some (Branch (_, child_addresses)) ->
       let expected =
-        List.init 32 (fun index ->
-            if index = 1 then "node-37" else "node-" ^ string_of_int (index + 1))
+        List.init 32 (fun index -> "node-" ^ string_of_int (index + 1))
       in
-      assert_equal_list "nested remove rewrites only the changed leaf address"
+      assert_equal_list "nested remove rewrites the changed leaf in place"
         expected (Array.to_list child_addresses)
   | Some _ -> failwith "nested remove first branch should be a branch"
   | None -> failwith "nested remove changed branch should be stored");
@@ -2341,9 +2340,9 @@ let test_restored_nested_remove_reuses_unchanged_branch_addresses_lazily () =
   let storage =
     {
       store_node =
-        (fun node ->
+        (fun ?address:given_address node ->
           incr writes;
-          let address = "node-" ^ string_of_int !writes in
+          let address = match given_address with Some a -> a | None -> "node-" ^ string_of_int !writes in
           Hashtbl.replace memory address node;
           address);
       restore_node =
@@ -2369,21 +2368,19 @@ let test_restored_nested_remove_reuses_unchanged_branch_addresses_lazily () =
     [ "node-2"; "node-33"; root ]
     !accessed;
   let removed_root, removed_stored = store removed in
-  if removed_root = root then
-    failwith "restored nested remove should create a new root address";
+  if removed_root <> root then
+    failwith "restored nested remove should rewrite the root in place";
   assert_equal_int
     "restored nested remove rewrites changed leaf, one branch, and root" 39
     !writes;
-  if removed_root <> "node-39" then
-    failwith "restored nested remove root should be the third new node";
   (match Hashtbl.find_opt memory removed_root with
   | Some (Branch (keys, child_addresses)) ->
       assert_equal_list
         "restored nested remove root keeps old second branch max key"
         [ 1023; 1055 ] (Array.to_list keys);
       assert_equal_list
-        "restored nested remove root reuses unchanged second branch"
-        [ "node-38"; "node-35" ] (Array.to_list child_addresses)
+        "restored nested remove root reuses both branch addresses"
+        [ "node-33"; "node-35" ] (Array.to_list child_addresses)
   | Some _ -> failwith "restored nested remove root should be a branch"
   | None -> failwith "restored nested remove root should be stored");
   assert_equal_list "restored nested remove keeps sorted values"
@@ -2398,9 +2395,9 @@ let test_restored_nested_add_reuses_unchanged_branch_addresses_lazily () =
   let storage =
     {
       store_node =
-        (fun node ->
+        (fun ?address:given_address node ->
           incr writes;
-          let address = "node-" ^ string_of_int !writes in
+          let address = match given_address with Some a -> a | None -> "node-" ^ string_of_int !writes in
           Hashtbl.replace memory address node;
           address);
       restore_node =
@@ -2427,21 +2424,19 @@ let test_restored_nested_add_reuses_unchanged_branch_addresses_lazily () =
     [ "node-2"; "node-33"; root ]
     !accessed;
   let added_root, added_stored = store added in
-  if added_root = root then
-    failwith "restored nested add should create a new root address";
+  if added_root <> root then
+    failwith "restored nested add should rewrite the root in place";
   assert_equal_int
     "restored nested add rewrites split leaves, split branches, and root" 41
     !writes;
-  if added_root <> "node-41" then
-    failwith "restored nested add root should be the fifth new node";
   (match Hashtbl.find_opt memory added_root with
   | Some (Branch (keys, child_addresses)) ->
       assert_equal_list
         "restored nested add root updates split first branch max keys"
         [ 480; 1024; 1055 ] (Array.to_list keys);
       assert_equal_list
-        "restored nested add root reuses unchanged second branch"
-        [ "node-39"; "node-40"; "node-35" ]
+        "restored nested add root reuses first and second branch addresses"
+        [ "node-33"; "node-40"; "node-35" ]
         (Array.to_list child_addresses)
   | Some _ -> failwith "restored nested add root should be a branch"
   | None -> failwith "restored nested add root should be stored");

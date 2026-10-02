@@ -4,7 +4,7 @@ type settings = { branching_factor : int; ref_type : ref_type }
 type 'a stored_node = Leaf of 'a array | Branch of 'a array * string array
 
 type 'a storage = {
-  store_node : 'a stored_node -> string;
+  store_node : ?address:string -> 'a stored_node -> string;
   restore_node : string -> 'a stored_node option;
   accessed : string -> unit;
 }
@@ -12,11 +12,17 @@ type 'a storage = {
 module Node = struct
   type 'a t =
     | Ref of { max_key : 'a; address : string }
-    | Leaf of { values : 'a array; len : int; address : string option }
+    | Leaf of {
+        values : 'a array;
+        len : int;
+        address : string option;
+        dirty : bool;
+      }
     | Branch of {
         keys : 'a array;
         children : 'a t array;
         address : string option;
+        dirty : bool;
       }
 end
 
@@ -74,8 +80,8 @@ let cache_storage settings storage =
       let cache = Hashtbl.create 128 in
       {
         store_node =
-          (fun node ->
-            let address = storage.store_node node in
+          (fun ?address node ->
+            let address = storage.store_node ?address node in
             Hashtbl.replace cache address node;
             address);
         restore_node =
@@ -94,8 +100,8 @@ let cache_storage settings storage =
       let cache = Hashtbl.create 128 in
       {
         store_node =
-          (fun node ->
-            let address = storage.store_node node in
+          (fun ?address node ->
+            let address = storage.store_node ?address node in
             remember cache address node;
             address);
         restore_node =
@@ -232,13 +238,13 @@ let show_node show_value root =
         add_line depth
           (Printf.sprintf "Ref(address=%s max_key=%s)" address
              (show_value max_key))
-    | Node.Leaf { values; len; address } ->
+    | Node.Leaf { values; len; address; _ } ->
         add_line depth
           (Printf.sprintf "Leaf(address=%s len=%d values=%s)"
              (show_option_address address)
              len
              (show_list show_value (array_prefix_to_list values len)))
-    | Node.Branch { keys; children; address } ->
+    | Node.Branch { keys; children; address; _ } ->
         add_line depth
           (Printf.sprintf "Branch(address=%s keys=%s)"
              (show_option_address address)
@@ -273,6 +279,7 @@ let node_branch_of_refs refs =
       keys = Array.of_list keys;
       children = Array.of_list children;
       address = None;
+      dirty = true;
     }
 
 let node_leaf_refs_of_chunks chunks =
@@ -280,7 +287,13 @@ let node_leaf_refs_of_chunks chunks =
   |> List.map (fun chunk ->
       let values = Array.of_list chunk in
       ( values.(Array.length values - 1),
-        Node.Leaf { values; len = Array.length values; address = None } ))
+        Node.Leaf
+          {
+            values;
+            len = Array.length values;
+            address = None;
+            dirty = true;
+          } ))
 
 let rec node_of_refs settings = function
   | [] -> None
@@ -333,25 +346,34 @@ let array_split values =
     Array.sub values left_length (length - left_length);
   ]
 
-let tree_leaf_refs_of_arrays arrays =
+(* cljs persistent-sorted-set keeps the previous storage address on a
+   modified node and re-stores it in place: the first replacement node
+   inherits [first_address], additional nodes get fresh addresses. *)
+let tree_leaf_refs_of_arrays ?first_address arrays =
   arrays
-  |> List.map (fun values ->
+  |> List.mapi (fun index values ->
+      let address = if index = 0 then first_address else None in
       ( values.(Array.length values - 1),
-        Node.Leaf { values; len = Array.length values; address = None } ))
+        Node.Leaf
+          { values; len = Array.length values; address; dirty = true } ))
 
-let tree_branch_refs_of_arrays settings keys children =
+let tree_branch_refs_of_arrays ?first_address settings keys children =
   let length = Array.length keys in
   if length = 0 then []
   else if length <= settings.branching_factor then
-    [ (keys.(length - 1), Node.Branch { keys; children; address = None }) ]
+    [
+      ( keys.(length - 1),
+        Node.Branch { keys; children; address = first_address; dirty = true } );
+    ]
   else
     let key_chunks = array_split keys in
     let child_chunks = array_split children in
-    List.map2
-      (fun keys children ->
+    List.mapi
+      (fun index (keys, children) ->
+        let address = if index = 0 then first_address else None in
         ( keys.(Array.length keys - 1),
-          Node.Branch { keys; children; address = None } ))
-      key_chunks child_chunks
+          Node.Branch { keys; children; address; dirty = true } ))
+      (List.combine key_chunks child_chunks)
 
 let ref_arrays_of_list refs =
   let keys, children = List.split refs in
@@ -388,12 +410,12 @@ let branch_splice_one keys children index replacement =
       (length - index - 1);
     (result_keys, result_children)
 
-let branch_replace_one settings keys children index key child =
+let branch_replace_one settings ?address keys children index key child =
   let keys = Array.copy keys in
   let children = Array.copy children in
   keys.(index) <- key;
   children.(index) <- child;
-  tree_branch_refs_of_arrays settings keys children
+  tree_branch_refs_of_arrays ?first_address:address settings keys children
 
 let min_child_occupancy settings = max 1 ((settings.branching_factor + 1) / 2)
 
@@ -408,17 +430,21 @@ let array_append left right =
     Array.blit right 0 result left_length right_length;
     result
 
-let leaf_ref values =
+let leaf_ref ?address values =
   if Array.length values = 0 then invalid_arg "leaf ref requires values";
   ( values.(Array.length values - 1),
-    Node.Leaf { values; len = Array.length values; address = None } )
+    Node.Leaf { values; len = Array.length values; address; dirty = true } )
 
-let branch_ref keys children =
+let branch_ref ?address keys children =
   let length = Array.length keys in
   if length = 0 then invalid_arg "branch ref requires keys";
   if length <> Array.length children then
     invalid_arg "branch keys and children arity mismatch";
-  (keys.(length - 1), Node.Branch { keys; children; address = None })
+  (keys.(length - 1), Node.Branch { keys; children; address; dirty = true })
+
+let node_address = function
+  | Node.Ref { address; _ } -> Some address
+  | Node.Leaf { address; _ } | Node.Branch { address; _ } -> address
 
 let total_cmp order_cmp equality_cmp left right =
   match order_cmp left right with 0 -> equality_cmp left right | n -> n
@@ -499,12 +525,19 @@ let node_of_stored_branch keys child_addresses address =
         Node.Ref { max_key = key; address = child_address })
       child_addresses
   in
-  Node.Branch { keys = Array.copy keys; children; address = Some address }
+  Node.Branch
+    { keys = Array.copy keys; children; address = Some address; dirty = false }
 
 let node_of_stored_node storage address =
   match restore_stored_node storage address with
   | Leaf values ->
-      Node.Leaf { values; len = Array.length values; address = Some address }
+      Node.Leaf
+        {
+          values;
+          len = Array.length values;
+          address = Some address;
+          dirty = false;
+        }
   | Branch (keys, child_addresses) ->
       node_of_stored_branch keys child_addresses address
 
@@ -533,18 +566,18 @@ let node_branch_parts storage = function
       | Node.Ref _ | Node.Leaf _ -> None)
   | Node.Leaf _ -> None
 
-let add_leaf_refs settings inserted =
+let add_leaf_refs settings ?address inserted =
   let changed =
     if Array.length inserted <= settings.branching_factor then [ inserted ]
     else array_split inserted
   in
-  tree_leaf_refs_of_arrays changed
+  tree_leaf_refs_of_arrays ?first_address:address changed
 
-let branch_refs_of_arrays settings keys children =
-  tree_branch_refs_of_arrays settings keys children
+let branch_refs_of_arrays ?first_address settings keys children =
+  tree_branch_refs_of_arrays ?first_address settings keys children
 
-let branch_replace_range settings keys children start remove_count replacements
-    =
+let branch_replace_range settings ?first_address keys children start
+    remove_count replacements =
   let refs = ref [] in
   for index = Array.length children - 1 downto 0 do
     if index = start then refs := replacements @ !refs;
@@ -552,9 +585,10 @@ let branch_replace_range settings keys children start remove_count replacements
       refs := (keys.(index), children.(index)) :: !refs
   done;
   let keys, children = ref_arrays_of_list !refs in
-  branch_refs_of_arrays settings keys children
+  branch_refs_of_arrays ?first_address settings keys children
 
-let rebalance_leaf_child storage settings keys children index child =
+let rebalance_leaf_child storage settings ?address keys children index child
+    =
   match node_leaf_values storage child with
   | None -> None
   | Some values -> (
@@ -573,8 +607,13 @@ let rebalance_leaf_child storage settings keys children index child =
                 if combined_length <= settings.branching_factor then
                   let merged = array_append values right in
                   Some
-                    (branch_replace_range settings keys children index 2
-                       [ leaf_ref merged ])
+                    (branch_replace_range settings ?first_address:address keys
+                       children index 2
+                       [
+                         leaf_ref
+                           ?address:(node_address children.(index))
+                           merged;
+                       ])
                 else
                   let needed = minimum - Array.length values in
                   if needed <= 0 || Array.length right - needed < minimum then
@@ -586,8 +625,16 @@ let rebalance_leaf_child storage settings keys children index child =
                       Array.sub right needed (Array.length right - needed)
                     in
                     Some
-                      (branch_replace_range settings keys children index 2
-                         [ leaf_ref left; leaf_ref right ])
+                      (branch_replace_range settings ?first_address:address
+                         keys children index 2
+                         [
+                           leaf_ref
+                             ?address:(node_address children.(index))
+                             left;
+                           leaf_ref
+                             ?address:(node_address children.(index + 1))
+                             right;
+                         ])
         in
         let rebalance_with_left () =
           if index = 0 then None
@@ -599,8 +646,15 @@ let rebalance_leaf_child storage settings keys children index child =
                 if combined_length <= settings.branching_factor then
                   let merged = array_append left values in
                   Some
-                    (branch_replace_range settings keys children (index - 1) 2
-                       [ leaf_ref merged ])
+                    (branch_replace_range settings ?first_address:address keys
+                       children
+                       (index - 1)
+                       2
+                       [
+                         leaf_ref
+                           ?address:(node_address children.(index - 1))
+                           merged;
+                       ])
                 else
                   let needed = minimum - Array.length values in
                   if needed <= 0 || Array.length left - needed < minimum then
@@ -611,14 +665,25 @@ let rebalance_leaf_child storage settings keys children index child =
                     let left = Array.sub left 0 left_keep in
                     let right = array_append borrowed values in
                     Some
-                      (branch_replace_range settings keys children (index - 1) 2
-                         [ leaf_ref left; leaf_ref right ])
+                      (branch_replace_range settings ?first_address:address
+                         keys children
+                         (index - 1)
+                         2
+                         [
+                           leaf_ref
+                             ?address:(node_address children.(index - 1))
+                             left;
+                           leaf_ref
+                             ?address:(node_address children.(index))
+                             right;
+                         ])
         in
         match rebalance_with_right () with
         | Some changed -> Some changed
         | None -> rebalance_with_left ())
 
-let rebalance_branch_child storage settings keys children index child =
+let rebalance_branch_child storage settings ?address keys children index
+    child =
   match node_branch_parts storage child with
   | None -> None
   | Some (child_keys, child_children) -> (
@@ -640,8 +705,13 @@ let rebalance_branch_child storage settings keys children index child =
                     array_append child_children right_children
                   in
                   Some
-                    (branch_replace_range settings keys children index 2
-                       [ branch_ref merged_keys merged_children ])
+                    (branch_replace_range settings ?first_address:address keys
+                       children index 2
+                       [
+                         branch_ref
+                           ?address:(node_address children.(index))
+                           merged_keys merged_children;
+                       ])
                 else
                   let needed = minimum - Array.length child_keys in
                   if needed <= 0 || Array.length right_keys - needed < minimum
@@ -662,10 +732,15 @@ let rebalance_branch_child storage settings keys children index child =
                         (Array.length right_children - needed)
                     in
                     Some
-                      (branch_replace_range settings keys children index 2
+                      (branch_replace_range settings ?first_address:address
+                         keys children index 2
                          [
-                           branch_ref left_keys left_children;
-                           branch_ref right_keys right_children;
+                           branch_ref
+                             ?address:(node_address children.(index))
+                             left_keys left_children;
+                           branch_ref
+                             ?address:(node_address children.(index + 1))
+                             right_keys right_children;
                          ])
         in
         let rebalance_with_left () =
@@ -683,8 +758,15 @@ let rebalance_branch_child storage settings keys children index child =
                     array_append left_children child_children
                   in
                   Some
-                    (branch_replace_range settings keys children (index - 1) 2
-                       [ branch_ref merged_keys merged_children ])
+                    (branch_replace_range settings ?first_address:address keys
+                       children
+                       (index - 1)
+                       2
+                       [
+                         branch_ref
+                           ?address:(node_address children.(index - 1))
+                           merged_keys merged_children;
+                       ])
                 else
                   let needed = minimum - Array.length child_keys in
                   if needed <= 0 || Array.length left_keys - needed < minimum
@@ -702,10 +784,17 @@ let rebalance_branch_child storage settings keys children index child =
                       array_append borrowed_children child_children
                     in
                     Some
-                      (branch_replace_range settings keys children (index - 1) 2
+                      (branch_replace_range settings ?first_address:address
+                         keys children
+                         (index - 1)
+                         2
                          [
-                           branch_ref left_keys left_children;
-                           branch_ref right_keys right_children;
+                           branch_ref
+                             ?address:(node_address children.(index - 1))
+                             left_keys left_children;
+                           branch_ref
+                             ?address:(node_address children.(index))
+                             right_keys right_children;
                          ])
         in
         match rebalance_with_right () with
@@ -722,6 +811,7 @@ let rec add_to_address storage settings order_cmp equality_cmp key_cmp value
              values;
              len = Array.length values;
              address = Some address;
+             dirty = false;
            })
   | Branch (keys, child_addresses) ->
       add_to_node (Some storage) settings order_cmp equality_cmp key_cmp value
@@ -731,13 +821,13 @@ and add_to_node storage settings order_cmp equality_cmp key_cmp value = function
   | Node.Ref _ as node ->
       add_to_node storage settings order_cmp equality_cmp key_cmp value
         (force_ref_node (storage_required storage) node)
-  | Node.Leaf { values; len; _ } -> (
+  | Node.Leaf { values; len; address; _ } -> (
       match find_insert_index_len order_cmp equality_cmp value values len with
       | `Found _ -> Tree_edit_unchanged
       | `Insert index ->
           let inserted = array_insert_len values len index value in
-          Tree_edit_changed (add_leaf_refs settings inserted))
-  | Node.Branch { keys; children; _ } -> (
+          Tree_edit_changed (add_leaf_refs settings ?address inserted))
+  | Node.Branch { keys; children; address; _ } -> (
       let index = find_child_index key_cmp value keys in
       match
         add_to_node storage settings order_cmp equality_cmp key_cmp value
@@ -745,12 +835,12 @@ and add_to_node storage settings order_cmp equality_cmp key_cmp value = function
       with
       | Tree_edit_unchanged -> Tree_edit_unchanged
       | Tree_edit_changed [ (key, child) ] ->
-          branch_replace_one settings keys children index key child
+          branch_replace_one settings ?address keys children index key child
           |> fun changed -> Tree_edit_changed changed
       | Tree_edit_changed changed ->
           let keys, children = branch_splice_one keys children index changed in
-          branch_refs_of_arrays settings keys children |> fun changed ->
-          Tree_edit_changed changed)
+          branch_refs_of_arrays ?first_address:address settings keys children
+          |> fun changed -> Tree_edit_changed changed)
 
 let rec remove_from_address storage settings order_cmp equality_cmp key_cmp
     value address =
@@ -763,6 +853,7 @@ let rec remove_from_address storage settings order_cmp equality_cmp key_cmp
              values;
              len = Array.length values;
              address = Some address;
+             dirty = false;
            })
   | Branch (keys, child_addresses) ->
       remove_from_node (Some storage) settings order_cmp equality_cmp key_cmp
@@ -774,7 +865,7 @@ and remove_from_node storage settings order_cmp equality_cmp key_cmp value =
   | Node.Ref _ as node ->
       remove_from_node storage settings order_cmp equality_cmp key_cmp value
         (force_ref_node (storage_required storage) node)
-  | Node.Leaf { values; len; _ } -> (
+  | Node.Leaf { values; len; address; _ } -> (
       match find_remove_index_len order_cmp equality_cmp value values len with
       | None -> Tree_edit_unchanged
       | Some index -> (
@@ -785,9 +876,14 @@ and remove_from_node storage settings order_cmp equality_cmp key_cmp value =
                 [
                   ( values.(Array.length values - 1),
                     Node.Leaf
-                      { values; len = Array.length values; address = None } );
+                      {
+                        values;
+                        len = Array.length values;
+                        address;
+                        dirty = true;
+                      } );
                 ]))
-  | Node.Branch { keys; children; _ } -> (
+  | Node.Branch { keys; children; address; _ } -> (
       let index = find_child_index key_cmp value keys in
       match
         remove_from_node storage settings order_cmp equality_cmp key_cmp value
@@ -797,23 +893,25 @@ and remove_from_node storage settings order_cmp equality_cmp key_cmp value =
       | Tree_edit_changed [ (key, child) ] ->
           let changed =
             match
-              rebalance_leaf_child storage settings keys children index child
+              rebalance_leaf_child storage settings ?address keys children
+                index child
             with
             | Some changed -> changed
             | None -> (
                 match
-                  rebalance_branch_child storage settings keys children index
-                    child
+                  rebalance_branch_child storage settings ?address keys
+                    children index child
                 with
                 | Some changed -> changed
                 | None ->
-                    branch_replace_one settings keys children index key child)
+                    branch_replace_one settings ?address keys children index
+                      key child)
           in
           Tree_edit_changed changed
       | Tree_edit_changed changed ->
           let keys, children = branch_splice_one keys children index changed in
-          branch_refs_of_arrays settings keys children |> fun changed ->
-          Tree_edit_changed changed)
+          branch_refs_of_arrays ?first_address:address settings keys children
+          |> fun changed -> Tree_edit_changed changed)
 
 let add value set =
   let equality_cmp = set.cmp in
@@ -1800,20 +1898,24 @@ let branch_key refs =
   | Some (key, _) -> key
   | None -> invalid_arg "branch requires at least one child"
 
-let store_branch storage child_refs =
+let store_branch ?address storage child_refs =
   let keys, child_addresses = split_branch_refs child_refs in
-  storage.store_node (Branch (keys, child_addresses))
+  storage.store_node ?address (Branch (keys, child_addresses))
 
-let rec store_branch_tree storage settings child_refs =
+let rec store_branch_tree ?address storage settings child_refs =
   if List.length child_refs <= settings.branching_factor then
-    let address = store_branch storage child_refs in
+    let address = store_branch ?address storage child_refs in
     (address, [ address ])
   else
     let child_groups = chunks settings.branching_factor child_refs in
     let branch_addresses =
       child_groups
-      |> List.map (fun child_group ->
-          let address = store_branch storage child_group in
+      |> List.mapi (fun index child_group ->
+          let address =
+            store_branch
+              ?address:(if index = 0 then address else None)
+              storage child_group
+          in
           (branch_key child_group, address))
     in
     let root, branch_tree_addresses =
@@ -1823,12 +1925,16 @@ let rec store_branch_tree storage settings child_refs =
 
 let rec store_node_tree storage settings = function
   | Node.Ref { address; _ } -> (address, [ address ])
-  | Node.Leaf { address = Some address; _ } -> (address, [ address ])
-  | Node.Leaf { values; len; address = None; _ } ->
-      let address = storage.store_node (Leaf (Array.sub values 0 len)) in
+  | Node.Leaf { address = Some address; dirty = false; _ } ->
       (address, [ address ])
-  | Node.Branch { address = Some address; _ } -> (address, [ address ])
-  | Node.Branch { keys; children; address = None; _ } ->
+  | Node.Leaf { values; len; address; _ } ->
+      let address =
+        storage.store_node ?address (Leaf (Array.sub values 0 len))
+      in
+      (address, [ address ])
+  | Node.Branch { address = Some address; dirty = false; _ } ->
+      (address, [ address ])
+  | Node.Branch { keys; children; address; _ } ->
       let child_refs = ref [] in
       let child_address_lists = ref [] in
       for index = 0 to Array.length children - 1 do
@@ -1841,7 +1947,7 @@ let rec store_node_tree storage settings = function
       let child_refs = List.rev !child_refs in
       let child_address_lists = List.rev !child_address_lists in
       let address, branch_addresses =
-        store_branch_tree storage settings child_refs
+        store_branch_tree ?address storage settings child_refs
       in
       (address, branch_addresses @ List.concat child_address_lists)
 

@@ -17,9 +17,9 @@ let () =
   let storage =
     {
       store_node =
-        (fun node ->
+        (fun ?address:given_address node ->
           incr next;
-          let address = string_of_int !next in
+          let address = match given_address with Some a -> a | None -> string_of_int !next in
           Hashtbl.replace memory address node;
           address);
       restore_node =
