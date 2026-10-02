@@ -116,9 +116,9 @@ let build_storage () =
   let next_address = ref 0 in
   {
     store_node =
-      (fun node ->
+      (fun ?address:given_address node ->
         incr next_address;
-        let address = "node-" ^ string_of_int !next_address in
+        let address = match given_address with Some a -> a | None -> "node-" ^ string_of_int !next_address in
         Hashtbl.replace memory address node;
         address);
     restore_node = (fun address -> Hashtbl.find_opt memory address);
@@ -150,7 +150,7 @@ let restored_wide_4096 =
      let storage =
        {
          store_node =
-           (fun _ -> invalid_arg "wide benchmark storage is read-only");
+           (fun ?address:_ _ -> invalid_arg "wide benchmark storage is read-only");
          restore_node = (fun address -> Hashtbl.find_opt memory address);
          accessed = (fun _ -> ());
        }

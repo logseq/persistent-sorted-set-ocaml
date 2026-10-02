@@ -4,7 +4,10 @@ type settings = { branching_factor : int; ref_type : ref_type }
 type 'a stored_node = Leaf of 'a array | Branch of 'a array * string array
 
 type 'a storage = {
-  store_node : 'a stored_node -> string;
+  store_node : ?address:string -> 'a stored_node -> string;
+      (** Write a node and return its address. When [address] is provided the
+          caller asks for the node to be stored at that existing address (the
+          cljs implementation's in-place rewrite of a modified stored node). *)
   restore_node : string -> 'a stored_node option;
   accessed : string -> unit;
 }

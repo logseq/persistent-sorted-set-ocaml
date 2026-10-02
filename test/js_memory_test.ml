@@ -55,9 +55,9 @@ let check ref_type label =
   let storage =
     {
       store_node =
-        (fun node ->
+        (fun ?address:given_address node ->
           incr writes;
-          let address = "node-" ^ string_of_int !writes in
+          let address = match given_address with Some a -> a | None -> "node-" ^ string_of_int !writes in
           Hashtbl.replace memory address node;
           address);
       restore_node =
