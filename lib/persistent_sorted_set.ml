@@ -826,7 +826,21 @@ and add_to_node storage settings order_cmp equality_cmp key_cmp value = function
       | `Found _ -> Tree_edit_unchanged
       | `Insert index ->
           let inserted = array_insert_len values len index value in
-          Tree_edit_changed (add_leaf_refs settings ?address inserted))
+          if len < settings.branching_factor then
+            (* common case: the leaf does not split, emit it directly
+               instead of going through the generic chunking pipeline *)
+            Tree_edit_changed
+              [
+                ( inserted.(len),
+                  Node.Leaf
+                    {
+                      values = inserted;
+                      len = len + 1;
+                      address;
+                      dirty = true;
+                    } );
+              ]
+          else Tree_edit_changed (add_leaf_refs settings ?address inserted))
   | Node.Branch { keys; children; address; _ } -> (
       let index = find_child_index key_cmp value keys in
       match
@@ -835,8 +849,22 @@ and add_to_node storage settings order_cmp equality_cmp key_cmp value = function
       with
       | Tree_edit_unchanged -> Tree_edit_unchanged
       | Tree_edit_changed [ (key, child) ] ->
-          branch_replace_one settings ?address keys children index key child
-          |> fun changed -> Tree_edit_changed changed
+          if Array.length keys <= settings.branching_factor then (
+            (* common case: the branch does not split, replace the child
+               in place and emit the branch directly *)
+            let keys = Array.copy keys in
+            let children = Array.copy children in
+            keys.(index) <- key;
+            children.(index) <- child;
+            Tree_edit_changed
+              [
+                ( keys.(Array.length keys - 1),
+                  Node.Branch { keys; children; address; dirty = true } );
+              ])
+          else
+            branch_replace_one settings ?address keys children index key
+              child
+            |> fun changed -> Tree_edit_changed changed
       | Tree_edit_changed changed ->
           let keys, children = branch_splice_one keys children index changed in
           branch_refs_of_arrays ?first_address:address settings keys children
