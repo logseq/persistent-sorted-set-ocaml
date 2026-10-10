@@ -932,8 +932,20 @@ and remove_from_node storage settings order_cmp equality_cmp key_cmp value =
                 with
                 | Some changed -> changed
                 | None ->
-                    branch_replace_one settings ?address keys children index
-                      key child)
+                    if Array.length keys <= settings.branching_factor then (
+                      (* common case: the child stays a single node, replace
+                         it in place instead of rebuilding the branch *)
+                      let keys = Array.copy keys in
+                      let children = Array.copy children in
+                      keys.(index) <- key;
+                      children.(index) <- child;
+                      [ ( keys.(Array.length keys - 1)
+                        , Node.Branch
+                            { keys; children; address; dirty = true } )
+                        ])
+                    else
+                      branch_replace_one settings ?address keys children
+                        index key child)
           in
           Tree_edit_changed changed
       | Tree_edit_changed changed ->
